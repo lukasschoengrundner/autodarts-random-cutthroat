@@ -1,0 +1,11 @@
+{
+  "name": "autodarts-random-cutthroat",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Development tests for the standalone Tampermonkey userscript",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "check": "node --check autodarts-random-cutthroat.user.js"
+  },
+  "engines": { "node": ">=20" }
+}

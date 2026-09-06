@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts Random Cutthroat Cricket
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.1.0
+// @version      0.2.0
 // @description  Random Cutthroat Cricket overlay for Autodarts. 7 random targets, Bull always/never/random, local Board Manager scoring.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -16,333 +16,434 @@
 
   const APP_ID = 'ad-rcc';
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
-  const DEFAULT_BOARD_HOST = 'autodarts.local';
-  const VERSION = '0.1.0';
+  const DEFAULT_BOARD_HOST = 'http://localhost:3180';
+  const VERSION = '0.2.0';
   const MARKS = ['–', '/', 'X', '⊗'];
-
+  const clone = (value) => JSON.parse(JSON.stringify(value));
   const defaultState = () => ({
-    screen: 'setup',
-    bullMode: 'random', // always | never | random
-    targetCount: 7,
-    targets: [],
-    players: [
-      { name: 'Spieler 1', marks: {}, score: 0 },
-      { name: 'Spieler 2', marks: {}, score: 0 },
-    ],
-    currentPlayer: 0,
-    turnDarts: 0,
-    turnSerial: 0,
-    history: [],
-    winner: null,
-    boardHost: DEFAULT_BOARD_HOST,
-    connected: false,
-    lastProcessedFingerprint: '',
-    minimized: false,
+    schemaVersion: 2, screen: 'setup', bullMode: 'random', targetCount: 7, targets: [],
+    players: [1, 2].map((i) => ({ name: `Spieler ${i}`, marks: {}, score: 0 })),
+    currentPlayer: 0, turnDarts: 0, turnSerial: 0, winner: null,
+    boardHost: DEFAULT_BOARD_HOST, inputMode: 'board', connected: false,
+    boardGate: 'await-empty', visit: null, legacyVisit: false, minimized: false, notice: '',
   });
 
   let state = loadState();
   let socket = null;
   let reconnectTimer = null;
   let renderQueued = false;
+  let lastBoard = null;
+  let takingOut = false;
+  let connectionStatus = 'Nicht verbunden';
+  let lastEvent = 'Noch keine Board-Meldung';
+  let storageWarning = '';
+  let resetHandled = false;
+
+  function validPlayers(players) {
+    return Array.isArray(players) && players.length >= 2 && players.length <= 8
+      && players.every((p) => p && typeof p.name === 'string' && p.marks && typeof p.marks === 'object'
+        && Number.isFinite(p.score) && p.score >= 0
+        && Object.values(p.marks).every((m) => Number.isInteger(m) && m >= 0 && m <= 3));
+  }
 
   function loadState() {
+    const base = defaultState();
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-      if (!saved) return defaultState();
-      const base = defaultState();
-      return {
-        ...base,
-        ...saved,
-        connected: false,
-        players: Array.isArray(saved.players) && saved.players.length >= 2 ? saved.players : base.players,
-        history: Array.isArray(saved.history) ? saved.history.slice(-100) : [],
-      };
+      if (!saved || !validPlayers(saved.players)) return base;
+      const loaded = { ...base, ...saved, connected: false, schemaVersion: 2 };
+      loaded.inputMode = saved.inputMode === 'test' ? 'test' : 'board';
+      loaded.boardHost = typeof saved.boardHost === 'string' ? saved.boardHost : DEFAULT_BOARD_HOST;
+      if (saved.schemaVersion !== 2 && (!saved.boardHost || saved.boardHost === 'autodarts.local')) {
+        loaded.boardHost = DEFAULT_BOARD_HOST;
+        loaded.notice = 'Die bisherige Standardadresse wurde auf diesen PC (localhost) umgestellt.';
+      }
+      loaded.bullMode = ['always', 'never', 'random'].includes(saved.bullMode) ? saved.bullMode : 'random';
+      loaded.targetCount = 7;
+      const validGame = Array.isArray(saved.targets) && saved.targets.length === 7
+        && new Set(saved.targets).size === 7 && saved.targets.every((n) => Number.isInteger(n) && ((n >= 1 && n <= 20) || n === 25))
+        && Number.isInteger(saved.currentPlayer) && saved.currentPlayer >= 0 && saved.currentPlayer < saved.players.length
+        && (saved.winner === null || (Number.isInteger(saved.winner) && saved.winner >= 0 && saved.winner < saved.players.length));
+      if (saved.screen !== 'game' || !validGame) {
+        loaded.screen = 'setup';
+        loaded.visit = null;
+        loaded.winner = null;
+        loaded.currentPlayer = 0;
+        loaded.turnDarts = 0;
+      } else if (saved.schemaVersion !== 2 || !validVisit(saved.visit, saved.players.length, saved.currentPlayer)) {
+        // A 0.1 game has no pre-visit snapshot: keep scores, but never guess its missing darts.
+        loaded.visit = null;
+        loaded.legacyVisit = true;
+        loaded.notice = 'Spielstand übernommen. Diese alte Aufnahme kann nicht rekonstruiert werden: Aufnahme abschließen oder ein neues Spiel starten.';
+      }
+      loaded.boardGate = loaded.screen === 'game' ? 'sync' : 'await-empty';
+      if (saved.schemaVersion === 2 && saved.boardGate === 'finished' && loaded.winner !== null) loaded.boardGate = 'finished';
+      if (loaded.inputMode === 'test' && loaded.visit) loaded.boardGate = 'ready';
+      delete loaded.history;
+      delete loaded.lastProcessedFingerprint;
+      return loaded;
     } catch (error) {
       console.warn('[Random Cutthroat] Could not load state', error);
-      return defaultState();
+      base.notice = 'Gespeicherter Spielstand konnte nicht geladen werden.';
+      return base;
     }
+  }
+
+  function validVisit(visit, playerCount, playerIndex) {
+    return visit && validPlayers(visit.base?.players) && visit.base.players.length === playerCount
+      && visit.base.currentPlayer === playerIndex && Array.isArray(visit.throws) && visit.throws.length <= 3
+      && visit.throws.every((s) => normalizeSegment(s)) && visit.overrides && typeof visit.overrides === 'object'
+      && Object.entries(visit.overrides).every(([i, s]) => /^\d$/.test(i) && Number(i) < visit.throws.length && (s === null || normalizeSegment(s)));
   }
 
   function saveState() {
-    const safe = { ...state, connected: false };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(safe));
-  }
-
-  function shuffle(values) {
-    const a = [...values];
-    for (let i = a.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [a[i], a[j]] = [a[j], a[i]];
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...state, connected: false }));
+      storageWarning = '';
+    } catch (error) {
+      storageWarning = 'Spielstand kann nicht gespeichert werden. Dieses Browserfenster geöffnet lassen.';
+      console.warn('[Random Cutthroat] Could not save state', error);
     }
-    return a;
   }
 
+  function update() { saveState(); render(); }
+  function shuffle(values) {
+    const result = [...values];
+    for (let i = result.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [result[i], result[j]] = [result[j], result[i]];
+    }
+    return result;
+  }
   function generateTargets(mode = state.bullMode, count = 7) {
     const numbers = Array.from({ length: 20 }, (_, i) => i + 1);
-    let targets;
-
-    if (mode === 'always') {
-      targets = [...shuffle(numbers).slice(0, count - 1), 25];
-    } else if (mode === 'never') {
-      targets = shuffle(numbers).slice(0, count);
-    } else {
-      targets = shuffle([...numbers, 25]).slice(0, count);
-    }
-
-    return targets.sort((a, b) => {
-      if (a === 25) return 1;
-      if (b === 25) return -1;
-      return a - b;
-    });
+    const targets = mode === 'always' ? [...shuffle(numbers).slice(0, count - 1), 25]
+      : shuffle(mode === 'never' ? numbers : [...numbers, 25]).slice(0, count);
+    return targets.sort((a, b) => a - b);
   }
-
-  function targetLabel(target) {
-    return target === 25 ? 'BULL' : String(target);
-  }
-
-  function targetValue(target) {
-    return target === 25 ? 25 : target;
-  }
-
-  function getMarks(player, target) {
-    return Math.max(0, Math.min(3, Number(player.marks?.[target] || 0)));
-  }
-
-  function snapshot(reason = '') {
-    return {
-      reason,
-      players: JSON.parse(JSON.stringify(state.players)),
-      currentPlayer: state.currentPlayer,
-      turnDarts: state.turnDarts,
-      winner: state.winner,
-    };
-  }
-
-  function pushHistory(reason) {
-    state.history.push(snapshot(reason));
-    state.history = state.history.slice(-100);
-  }
-
-  function allClosed(player) {
-    return state.targets.length > 0 && state.targets.every((target) => getMarks(player, target) >= 3);
-  }
-
+  function targetLabel(target) { return target === 25 ? 'BULL' : String(target); }
+  function targetValue(target) { return target; }
+  function getMarks(player, target) { return Math.max(0, Math.min(3, Number(player.marks?.[target] || 0))); }
+  function allClosed(player) { return state.targets.length > 0 && state.targets.every((t) => getMarks(player, t) === 3); }
   function checkWinner(playerIndex) {
     const player = state.players[playerIndex];
-    if (!player || !allClosed(player)) return false;
-
-    const hasLowestOrTiedScore = state.players.every((other, index) => (
-      index === playerIndex || player.score <= other.score
-    ));
-
-    if (hasLowestOrTiedScore) {
+    if (player && allClosed(player) && state.players.every((other) => player.score <= other.score)) {
       state.winner = playerIndex;
       return true;
     }
     return false;
   }
 
-  function normalizeMultiplier(segment) {
-    const m = Number(segment?.multiplier);
-    if (Number.isFinite(m) && m >= 0 && m <= 3) return m;
-
-    const name = String(segment?.name || '').toUpperCase();
-    if (name.startsWith('T')) return 3;
-    if (name.startsWith('D') || name === 'DB' || name.includes('BULLSEYE')) return 2;
-    if (name.startsWith('S') || name.includes('BULL')) return 1;
-    return 0;
-  }
-
-  function normalizeNumber(segment) {
-    const n = Number(segment?.number);
-    if (n === 25 || (n >= 1 && n <= 20)) return n;
-    const name = String(segment?.name || '').toUpperCase();
-    if (name.includes('BULL')) return 25;
-    const parsed = Number(name.replace(/[^0-9]/g, ''));
-    return parsed >= 1 && parsed <= 20 ? parsed : 0;
-  }
-
-  function processThrow(segment, source = 'board') {
-    if (state.screen !== 'game' || state.winner !== null) return;
-
-    const number = normalizeNumber(segment);
-    const multiplier = normalizeMultiplier(segment);
-    const name = String(segment?.name || (number ? `${multiplier}x${number}` : 'MISS'));
-
-    pushHistory(`${source}:${name}`);
-
-    const player = state.players[state.currentPlayer];
-    const isTarget = state.targets.includes(number);
-
-    if (isTarget && multiplier > 0) {
-      const before = getMarks(player, number);
-      const total = before + multiplier;
-      const newMarks = Math.min(3, total);
-      const excessMarks = Math.max(0, total - 3);
-      player.marks[number] = newMarks;
-
-      if (excessMarks > 0) {
-        const penalty = excessMarks * targetValue(number);
-        state.players.forEach((opponent, index) => {
-          if (index !== state.currentPlayer && getMarks(opponent, number) < 3) {
-            opponent.score += penalty;
-          }
-        });
-      }
+  function normalizeSegment(segment) {
+    if (!segment || typeof segment !== 'object') return null;
+    let number;
+    let multiplier;
+    if (segment.number != null && segment.multiplier != null && segment.number !== '' && segment.multiplier !== '') {
+      if (!['number', 'string'].includes(typeof segment.number) || !['number', 'string'].includes(typeof segment.multiplier)) return null;
+      number = Number(segment.number);
+      multiplier = Number(segment.multiplier);
+    } else {
+      const name = String(segment.name || '').toUpperCase().trim();
+      const bull = { BULL: 1, SB: 1, SBULL: 1, BULLSEYE: 2, DB: 2, DBULL: 2 };
+      const match = /^([SDT])(\d{1,2})$/.exec(name);
+      if (Object.hasOwn(bull, name)) { number = 25; multiplier = bull[name]; }
+      else if (['MISS', 'M0', 'S0', 'OUTSIDE'].includes(name)) { number = 0; multiplier = 0; }
+      else if (match) { number = Number(match[2]); multiplier = { S: 1, D: 2, T: 3 }[match[1]]; }
+      else return null;
     }
-
-    state.turnDarts = Math.min(3, state.turnDarts + 1);
-    checkWinner(state.currentPlayer);
-    saveState();
-    render();
+    if (!Number.isInteger(number) || !Number.isInteger(multiplier)) return null;
+    if (number === 0 && multiplier === 0) return { number: 0, multiplier: 0, name: 'MISS' };
+    if (!((number >= 1 && number <= 20) || number === 25) || multiplier < 1 || multiplier > (number === 25 ? 2 : 3)) return null;
+    return { number, multiplier, name: `${['', 'S', 'D', 'T'][multiplier]}${number}` };
   }
 
+  function beginVisit() {
+    state.visit = { base: { players: clone(state.players), currentPlayer: state.currentPlayer }, throws: [], overrides: {} };
+    state.turnDarts = 0;
+    state.legacyVisit = false;
+  }
+  function effectiveThrow(index) {
+    return Object.hasOwn(state.visit.overrides, index) ? state.visit.overrides[index] : state.visit.throws[index];
+  }
+  function scoreSegment(segment) {
+    if (!segment || state.winner !== null || !state.targets.includes(segment.number)) return;
+    const player = state.players[state.currentPlayer];
+    const total = getMarks(player, segment.number) + segment.multiplier;
+    player.marks[segment.number] = Math.min(3, total);
+    const penalty = Math.max(0, total - 3) * targetValue(segment.number);
+    state.players.forEach((opponent, i) => {
+      if (i !== state.currentPlayer && getMarks(opponent, segment.number) < 3) opponent.score += penalty;
+    });
+    checkWinner(state.currentPlayer);
+  }
+  function replayVisit() {
+    state.players = clone(state.visit.base.players);
+    state.currentPlayer = state.visit.base.currentPlayer;
+    state.winner = null;
+    state.turnDarts = state.visit.throws.length;
+    state.visit.throws.forEach((_, i) => scoreSegment(effectiveThrow(i)));
+  }
+  function reconcileVisit(throws) {
+    if (!state.visit) beginVisit();
+    // Local corrections survive duplicate snapshots, but a changed board slot supersedes them.
+    for (const key of Object.keys(state.visit.overrides)) {
+      if (!throws[key] || JSON.stringify(throws[key]) !== JSON.stringify(state.visit.throws[key])) delete state.visit.overrides[key];
+    }
+    state.visit.throws = clone(throws);
+    replayVisit();
+  }
+  function processThrow(segment, source = 'test') {
+    if (source !== 'test' || state.inputMode !== 'test' || state.screen !== 'game' || state.legacyVisit || state.winner !== null || state.turnDarts >= 3) return;
+    const normalized = normalizeSegment(segment);
+    if (!normalized) return;
+    if (!state.visit) beginVisit();
+    state.visit.throws.push(normalized);
+    replayVisit();
+    update();
+  }
   function nextPlayer() {
     if (state.screen !== 'game' || state.winner !== null) return;
+    // A manual change waits for the physical takeout; repeated clicks cannot skip players.
+    if (state.inputMode === 'board' && state.boardGate === 'await-empty') return;
     state.currentPlayer = (state.currentPlayer + 1) % state.players.length;
-    state.turnDarts = 0;
     state.turnSerial += 1;
-    state.lastProcessedFingerprint = '';
-    saveState();
-    render();
+    beginVisit();
+    state.boardGate = state.inputMode === 'board' ? 'await-empty' : 'ready';
+    state.notice = '';
+    update();
   }
-
   function undo() {
-    const previous = state.history.pop();
-    if (!previous) return;
-    state.players = previous.players;
-    state.currentPlayer = previous.currentPlayer;
-    state.turnDarts = previous.turnDarts;
-    state.winner = previous.winner;
-    saveState();
-    render();
+    if (state.screen !== 'game' || !state.visit || state.legacyVisit || state.boardGate === 'finished') return;
+    if (state.inputMode === 'test') {
+      state.visit.throws.pop();
+      delete state.visit.overrides[state.visit.throws.length];
+    }
+    else {
+      if (state.boardGate !== 'ready' || takingOut) return;
+      const index = state.visit.throws.findLastIndex((_, i) => effectiveThrow(i) !== null);
+      if (index < 0) return;
+      // Keep the physical slot occupied so the next snapshot cannot add this dart again.
+      state.visit.overrides[index] = null;
+    }
+    replayVisit();
+    update();
   }
-
+  function correctThrow(index, value) {
+    if (!state.visit || state.legacyVisit || state.boardGate !== 'ready' || takingOut || !Number.isInteger(index) || index < 0 || index >= state.visit.throws.length) return;
+    if (value === 'board') delete state.visit.overrides[index];
+    else {
+      const segment = value === 'ignore' ? null : normalizeSegment({ name: value });
+      if (segment === null && value !== 'ignore') return;
+      state.visit.overrides[index] = segment;
+    }
+    replayVisit();
+    update();
+  }
   function startGame() {
     const inputs = [...document.querySelectorAll(`#${APP_ID}-player-list input[data-player-name]`)];
-    const names = inputs.map((input, i) => input.value.trim() || `Spieler ${i + 1}`);
-    if (names.length < 2) return;
-
-    state.players = names.map((name) => ({ name, marks: {}, score: 0 }));
-    state.targets = generateTargets(state.bullMode, state.targetCount);
+    if (inputs.length < 2 || inputs.length > 8) return;
+    state.players = inputs.map((input, i) => ({ name: input.value.trim() || `Spieler ${i + 1}`, marks: {}, score: 0 }));
+    state.targets = generateTargets();
     state.currentPlayer = 0;
-    state.turnDarts = 0;
     state.turnSerial = 0;
-    state.history = [];
     state.winner = null;
     state.screen = 'game';
-    state.lastProcessedFingerprint = '';
-    saveState();
-    render();
-    connectBoard(true);
+    state.notice = '';
+    beginVisit();
+    state.boardGate = state.inputMode === 'board' ? 'await-empty' : 'ready';
+    takingOut = false;
+    if (state.inputMode === 'board') connectBoard(true);
+    else disconnectBoard();
+    update();
   }
-
   function newGame() {
     state.screen = 'setup';
     state.winner = null;
-    state.history = [];
+    state.visit = null;
     state.turnDarts = 0;
-    saveState();
-    render();
+    state.legacyVisit = false;
+    state.notice = '';
+    state.boardGate = 'await-empty';
+    update();
   }
-
   function addPlayer() {
     if (state.players.length >= 8) return;
     state.players.push({ name: `Spieler ${state.players.length + 1}`, marks: {}, score: 0 });
-    saveState();
-    render();
+    update();
   }
-
-  function removePlayer() {
-    if (state.players.length <= 2) return;
-    state.players.pop();
-    saveState();
-    render();
-  }
+  function removePlayer() { if (state.players.length > 2) { state.players.pop(); update(); } }
 
   function boardWsUrl() {
     const raw = String(state.boardHost || DEFAULT_BOARD_HOST).trim();
-    if (/^wss?:\/\//i.test(raw)) {
-      return raw.includes('/api/events') ? raw : `${raw.replace(/\/$/, '')}/api/events?type=state`;
-    }
-    if (/^https?:\/\//i.test(raw)) {
-      const url = new URL(raw);
-      const protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${protocol}//${url.host}/api/events?type=state`;
-    }
-    const host = raw.replace(/^\/+|\/+$/g, '');
-    if (host.includes(':')) return `wss://${host}/api/events?type=state`;
-    return `wss://${host}:3181/api/events?type=state`;
+    const explicit = /^[a-z][a-z\d+.-]*:\/\//i.test(raw);
+    const authority = (explicit ? raw.slice(raw.indexOf('://') + 3) : raw).split(/[/?#]/)[0];
+    const explicitPort = /:(\d+)$/.exec(authority)?.[1];
+    const url = new URL(explicit ? raw : `http://${raw}`);
+    if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol) || url.username || url.password || url.hash) throw new Error('Bitte eine HTTP-, HTTPS-, WS- oder WSS-Adresse ohne Zugangsdaten eingeben.');
+    if (!explicit) url.protocol = url.port === '3181' ? 'https:' : 'http:';
+    const secure = ['https:', 'wss:'].includes(url.protocol);
+    url.protocol = secure ? 'wss:' : 'ws:';
+    if (explicitPort) url.port = explicitPort;
+    else if (!url.port) url.port = secure ? '3181' : '3180';
+    if (!['/', '/api/events', '/api/events/'].includes(url.pathname)) throw new Error('Bitte nur die Board-Adresse oder /api/events angeben.');
+    url.pathname = '/api/events';
+    url.search = '?type=state';
+    return url.toString();
   }
-
-  function connectBoard(force = false) {
-    if (force && socket) {
-      try { socket.close(); } catch (_) { /* ignore */ }
-      socket = null;
-    }
-    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-
+  function disconnectBoard() {
     clearTimeout(reconnectTimer);
-    let url;
+    reconnectTimer = null;
+    const previous = socket;
+    socket = null; // Invalidate handlers before asynchronous close/error events can arrive.
+    if (previous) { try { previous.close(); } catch (_) { /* already closed */ } }
+    state.connected = false;
+    lastBoard = null;
+    takingOut = false;
+    resetHandled = false;
+    connectionStatus = state.inputMode === 'test' ? 'Testmodus – ohne Kameras' : 'Nicht verbunden';
+  }
+  function blockForSync(message) {
+    if (state.screen === 'game' && state.inputMode === 'board' && !['await-empty', 'finished'].includes(state.boardGate)) {
+      state.boardGate = 'sync';
+      state.notice = message;
+    }
+  }
+  function connectBoard(force = false) {
+    if (state.inputMode !== 'board') return;
+    if (force) {
+      blockForSync('Verbindung neu gestartet. Aktuelle Aufnahme prüfen und unten synchronisieren.');
+      disconnectBoard();
+    }
+    if (socket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(socket.readyState)) return;
+    clearTimeout(reconnectTimer);
+    lastBoard = null;
+    let active;
     try {
-      url = boardWsUrl();
-      socket = new WebSocket(url);
+      active = new WebSocket(boardWsUrl());
+      socket = active;
+      connectionStatus = 'Verbindung wird aufgebaut …';
     } catch (error) {
-      console.warn('[Random Cutthroat] Invalid Board Manager URL', error);
       state.connected = false;
-      render();
+      connectionStatus = `Verbindung nicht möglich: ${error.message}`;
+      update();
       return;
     }
-
-    socket.addEventListener('open', () => {
+    active.addEventListener('open', () => {
+      if (socket !== active) return;
       state.connected = true;
-      render();
+      connectionStatus = 'Verbindung offen; Board-Meldungen werden geprüft';
+      update();
     });
-
-    socket.addEventListener('message', (event) => {
-      handleBoardMessage(event.data);
+    active.addEventListener('message', (event) => {
+      if (socket === active && state.inputMode === 'board') handleBoardMessage(event.data);
     });
-
-    socket.addEventListener('close', () => {
+    active.addEventListener('close', () => {
+      if (socket !== active) return;
+      socket = null;
       state.connected = false;
-      render();
-      reconnectTimer = setTimeout(() => connectBoard(false), 3000);
+      lastBoard = null;
+      takingOut = false;
+      connectionStatus = 'Verbindung unterbrochen. Neuer Versuch in 3 Sekunden.';
+      blockForSync('Während der Unterbrechung können Würfe oder Spielerwechsel fehlen. Aufnahme nach dem Verbinden prüfen.');
+      update();
+      reconnectTimer = setTimeout(() => connectBoard(), 3000);
     });
-
-    socket.addEventListener('error', () => {
+    active.addEventListener('error', () => {
+      if (socket !== active) return;
       state.connected = false;
-      render();
+      lastBoard = null;
+      blockForSync('Verbindungsfehler. Aufnahme nach dem Verbinden prüfen.');
+      connectionStatus = 'Board nicht erreichbar: Adresse, Autodarts Desktop, Browser-Netzwerkfreigabe und gegebenenfalls Zertifikat prüfen.';
+      update();
     });
+    render();
   }
 
+  function parseBoardState(data) {
+    if (!data || typeof data !== 'object') return null;
+    const count = data.numThrows ?? (Array.isArray(data.throws) ? data.throws.length : null);
+    if (!Number.isInteger(count) || count < 0 || count > 3) return null;
+    const rawThrows = data.throws ?? (count === 0 ? [] : null);
+    if (!Array.isArray(rawThrows) || rawThrows.length !== count) return null;
+    const throws = rawThrows.map((t) => normalizeSegment(t?.segment));
+    if (throws.some((t) => t === null)) return null;
+    return { throws, event: String(data.event || ''), status: String(data.status || ''), running: data.running !== false };
+  }
+  function boardOperational(board) {
+    return board?.running && !/^(Starting|Stopped|Stopping|Calibration)/i.test(board.event)
+      && !/^(Starting|Stopped|Stopping|Calibrating)/i.test(board.status);
+  }
   function handleBoardMessage(raw) {
+    if (state.inputMode !== 'board') return;
     let packet;
-    try {
-      packet = JSON.parse(raw);
-    } catch (_) {
+    try { packet = JSON.parse(raw); } catch (_) { return; }
+    if (!packet || typeof packet !== 'object' || (packet.type && packet.type !== 'state')) return;
+    const data = packet.data ?? packet;
+    const board = parseBoardState(data);
+    lastEvent = String(data?.event || data?.status || 'Zustand');
+    if (!board) {
+      lastBoard = null;
+      connectionStatus = 'Unvollständige oder ungültige Board-Meldung; keine Punkte übernommen.';
+      render();
       return;
     }
-
-    if (packet?.type && packet.type !== 'state') return;
-    const data = packet?.data || packet;
-    const event = String(data?.event || '');
-
-    if (event === 'Throw detected') {
-      const throws = Array.isArray(data.throws) ? data.throws : [];
-      const latest = throws[throws.length - 1];
-      if (!latest?.segment) return;
-
-      const fingerprint = `${state.turnSerial}|${data.numThrows ?? throws.length}|${throws.map((t) => t?.segment?.name || '?').join(',')}`;
-      if (fingerprint === state.lastProcessedFingerprint) return;
-      state.lastProcessedFingerprint = fingerprint;
-      processThrow(latest.segment, 'board');
+    lastBoard = board;
+    connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
+    if (state.screen !== 'game' || state.boardGate === 'finished') { render(); return; }
+    if (!boardOperational(board)) {
+      blockForSync('Die Erkennung wurde angehalten oder neu gestartet. Board und Aufnahme vor dem Fortsetzen prüfen.');
+      update();
       return;
     }
-
-    if (event === 'Takeout finished' && state.turnDarts > 0) {
-      nextPlayer();
+    if (board.event === 'Takeout finished' && board.throws.length === 0) takingOut = false;
+    if (board.event === 'Takeout started' || board.status === 'Takeout in progress') { takingOut = true; render(); return; }
+    if (state.boardGate === 'sync') { render(); return; }
+    if (board.event !== 'Manual reset') resetHandled = false;
+    if (board.event === 'Manual reset') {
+      if (resetHandled) return;
+      resetHandled = true;
+      // Roll back this visit only. The physical board must be cleared explicitly before reuse.
+      if (state.visit && !state.legacyVisit) { state.visit.throws = []; state.visit.overrides = {}; replayVisit(); }
+      state.boardGate = 'sync';
+      state.notice = 'Board zurückgesetzt. Aktuelle Aufnahme zurückgenommen. Darts herausziehen und mit leerem Board fortsetzen.';
+      takingOut = false;
+      update();
+      return;
+    }
+    if (state.boardGate === 'await-empty') {
+      if (board.throws.length === 0 && !takingOut) state.boardGate = 'ready';
+      if (board.event === 'Takeout finished' && board.throws.length === 0) { takingOut = false; state.boardGate = 'ready'; }
+      update();
+      return;
+    }
+    if (board.event === 'Takeout finished') {
+      if (board.throws.length !== 0) { render(); return; }
+      takingOut = false;
+      if (state.winner !== null) state.boardGate = 'finished';
+      else if (state.visit?.throws.length) { nextPlayer(); state.boardGate = 'ready'; }
+      update();
+      return;
+    }
+    if (takingOut) { render(); return; }
+    if (board.throws.length < (state.visit?.throws.length || 0) && !/correct|undo|remove/i.test(board.event)) {
+      blockForSync('Die Wurfanzahl ist unerwartet gesunken. Aufnahme prüfen; möglicherweise fehlt der Spielerwechsel.');
+      update();
+      return;
+    }
+    if (JSON.stringify(state.visit?.throws) !== JSON.stringify(board.throws)) {
+      reconcileVisit(board.throws);
+      update();
     }
   }
+  function resumeBoard() {
+    if (state.boardGate !== 'sync' || !state.connected || !boardOperational(lastBoard) || state.legacyVisit || takingOut) return;
+    if (lastBoard.throws.length === 0 && state.visit?.throws.length) return; // User must finish the scored visit instead.
+    reconcileVisit(lastBoard.throws);
+    state.boardGate = 'ready';
+    state.notice = '';
+    update();
+  }
+
 
   function injectStyles() {
     if (document.getElementById(`${APP_ID}-style`)) return;
@@ -359,7 +460,9 @@
       .${APP_ID}-badge{font-size:11px;padding:4px 8px;border-radius:999px;background:#ffffff12;color:#bfc6d0}
       .${APP_ID}-dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:#e24a4a}.connected .${APP_ID}-dot{background:#40c878}
       .${APP_ID}-actions{display:flex;flex-wrap:wrap;gap:8px}
-      #${APP_ID}-panel button,#${APP_ID}-panel input{font:inherit}
+      #${APP_ID}-panel button,#${APP_ID}-panel input,#${APP_ID}-panel select{font:inherit}
+      #${APP_ID}-panel button:disabled{opacity:.45;cursor:not-allowed}
+      #${APP_ID}-panel select{max-width:100%;background:#171a20;color:#fff;border:1px solid #ffffff35;border-radius:8px;padding:8px}
       .${APP_ID}-btn{border:1px solid #ffffff25;background:#20242b;color:#fff;border-radius:12px;padding:10px 13px;cursor:pointer;font-weight:700}
       .${APP_ID}-btn:hover{background:#2a3039}.primary{background:#f08a24;border-color:#f08a24;color:#151515}.primary:hover{background:#ff9a35}.danger{border-color:#d85b5b66}
       .${APP_ID}-grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
@@ -426,8 +529,12 @@
         </div>
         <div class="${APP_ID}-card">
           <h3>Board Manager</h3>
-          <input id="${APP_ID}-host" class="${APP_ID}-input" value="${escapeHtml(state.boardHost)}" placeholder="autodarts.local">
-          <div class="${APP_ID}-hint">Standard: <b>autodarts.local</b> → WSS Port 3181. Bei selbstsigniertem Zertifikat zuerst https://HOST:3181 im Browser öffnen und Zertifikat bestätigen.</div>
+          <div class="${APP_ID}-seg" style="margin-bottom:12px">
+            <button data-mode="board" class="${state.inputMode === 'board' ? 'active' : ''}">Mit Kameras</button>
+            <button data-mode="test" class="${state.inputMode === 'test' ? 'active' : ''}">Ohne Kameras testen</button>
+          </div>
+          <input id="${APP_ID}-host" class="${APP_ID}-input" value="${escapeHtml(state.boardHost)}" placeholder="http://localhost:3180" ${state.inputMode === 'test' ? 'disabled' : ''}>
+          <div class="${APP_ID}-hint">Kameras am selben PC: <b>http://localhost:3180</b>. Auf einem anderen Gerät die Adresse des Kamera-PCs eingeben. HTTPS/WSS über Port 3181 nur verwenden, wenn dort angeboten und das Zertifikat im Browser gültig ist. Im Testmodus werden keine Board-Meldungen verarbeitet.</div>
         </div>
         <div class="${APP_ID}-card">
           <h3>Regeln v${VERSION}</h3>
@@ -454,9 +561,29 @@
     const scoreCells = state.players.map((player, index) => `<td class="${index === state.currentPlayer ? 'active-player' : ''}"><span class="${APP_ID}-score">${player.score}</span></td>`).join('');
     const darts = [0,1,2].map((i) => `<span class="${APP_ID}-dartdot ${i < state.turnDarts ? 'used' : ''}"></span>`).join('');
     const winner = state.winner !== null ? `<div class="${APP_ID}-winner">🏆 ${escapeHtml(state.players[state.winner].name)} gewinnt!</div>` : '';
+    const visitEditable = state.boardGate === 'ready' && !takingOut && !state.legacyVisit;
+    const canUndo = visitEditable && state.visit?.throws.some((_, i) => effectiveThrow(i) !== null);
+    const choices = ['MISS', ...Array.from({ length: 20 }, (_, i) => i + 1).flatMap((n) => ['S', 'D', 'T'].map((m) => `${m}${n}`)), 'S25', 'D25'];
+    const corrections = (state.visit?.throws || []).map((segment, i) => {
+      const selected = Object.hasOwn(state.visit.overrides, i) ? (effectiveThrow(i)?.name || 'ignore') : 'board';
+      return `<label>Dart ${i + 1}: <select data-correct="${i}" aria-label="Dart ${i + 1} korrigieren" ${visitEditable ? '' : 'disabled'}>
+        <option value="board" ${selected === 'board' ? 'selected' : ''}>${escapeHtml(segment.name)} (Original)</option>
+        <option value="ignore" ${selected === 'ignore' ? 'selected' : ''}>Gestrichen</option>
+        ${choices.map((value) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${value}</option>`).join('')}
+      </select></label>`;
+    }).join(' ');
+    const canResume = state.connected && boardOperational(lastBoard) && !state.legacyVisit && !takingOut
+      && (lastBoard.throws.length > 0 || !state.visit?.throws.length);
 
     return `
       ${winner}
+      ${state.inputMode === 'board' && state.boardGate === 'await-empty' ? `<div class="${APP_ID}-hint" role="status">Bitte das Board leeren. Die Wertung beginnt nach einer leeren Board-Meldung.</div>` : ''}
+      ${state.inputMode === 'board' && state.boardGate === 'sync' ? `<div class="${APP_ID}-card" role="status">
+        <b>Aufnahme synchronisieren</b>
+        <p>${lastBoard ? `Board meldet: ${lastBoard.throws.map((s) => escapeHtml(s.name)).join(', ') || 'keine Darts'}.` : 'Auf eine gültige Board-Meldung warten.'}</p>
+        <div class="${APP_ID}-hint">Nur fortsetzen, wenn die gemeldeten Darts zur aktuellen Aufnahme gehören. Bei bereits entnommenen Darts die Aufnahme abschließen. Neue Würfe bleiben bis dahin gesperrt.</div>
+        <button class="${APP_ID}-btn" data-action="resume" ${canResume ? '' : 'disabled'}>${lastBoard?.throws.length ? 'Aufnahme für aktuellen Spieler übernehmen' : 'Mit leerem Board fortsetzen'}</button>
+      </div>` : ''}
       <div class="${APP_ID}-turn">
         <div><b>Am Board:</b> ${escapeHtml(state.players[state.currentPlayer]?.name || '')}</div>
         <div class="${APP_ID}-dartdots">${darts}</div>
@@ -472,17 +599,19 @@
         </table>
       </div>
       <div class="${APP_ID}-actions" style="margin-top:14px">
-        <button class="${APP_ID}-btn" data-action="undo" ${state.history.length ? '' : 'disabled'}>↶ Undo</button>
-        <button class="${APP_ID}-btn" data-action="next">Nächster Spieler</button>
+        <button class="${APP_ID}-btn" data-action="undo" ${canUndo ? '' : 'disabled'}>${state.inputMode === 'test' ? '↶ Undo' : 'Letzten Dart streichen'}</button>
+        <button class="${APP_ID}-btn" data-action="next" ${state.winner !== null || (state.inputMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
         <button class="${APP_ID}-btn danger" data-action="new-game">Neues Spiel</button>
       </div>
-      <details style="margin-top:14px;color:#9ca5b2">
+      <div class="${APP_ID}-test">${corrections}</div>
+      ${state.inputMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Bei Fehlwürfen außerhalb des Boards im Board Manager einen MISS ergänzen.</div>` : ''}
+      ${state.inputMode === 'test' ? `<details open data-details="tests" style="margin-top:14px;color:#9ca5b2">
         <summary style="cursor:pointer">Testwürfe (ohne Board)</summary>
         <div class="${APP_ID}-test">
-          ${state.targets.flatMap((target) => [1,2,3].map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}">${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
-          <button class="${APP_ID}-btn" data-test-target="0" data-test-m="0">MISS</button>
+          ${state.targets.flatMap((target) => (target === 25 ? [1,2] : [1,2,3]).map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
+          <button class="${APP_ID}-btn" data-test-target="0" data-test-m="0" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>MISS</button>
         </div>
-      </details>
+      </details>` : ''}
     `;
   }
 
@@ -496,6 +625,15 @@
       const launcher = document.getElementById(`${APP_ID}-launcher`);
       if (!panel || !launcher) return;
 
+      // Status events may arrive while a player edits a name/address or opens a selector.
+      // Input handlers save drafts immediately; defer replacement while a select has focus.
+      if (panel.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+      const focused = panel.contains(document.activeElement) ? document.activeElement : null;
+      const focusId = focused?.id;
+      const focusPlayer = focused?.dataset.playerName;
+      const selection = focused?.tagName === 'INPUT' ? [focused.selectionStart, focused.selectionEnd] : null;
+      const detailStates = [...panel.querySelectorAll('details[data-details]')].map((el) => [el.dataset.details, el.open]);
+
       panel.classList.toggle(`${APP_ID}-hidden`, state.minimized);
       launcher.style.display = state.minimized ? 'block' : 'none';
 
@@ -504,20 +642,38 @@
           <div class="${APP_ID}-top">
             <div class="${APP_ID}-title">🎯 Random Cutthroat <span class="${APP_ID}-badge">v${VERSION}</span></div>
             <div class="${APP_ID}-actions">
-              <span class="${APP_ID}-badge"><span class="${APP_ID}-dot"></span> ${state.connected ? 'Board verbunden' : 'Board offline'}</span>
-              <button class="${APP_ID}-btn" data-action="connect">Verbinden</button>
+              <span class="${APP_ID}-badge"><span class="${APP_ID}-dot"></span> ${state.inputMode === 'test' ? 'Testmodus' : state.connected ? 'Board verbunden' : 'Board offline'}</span>
+              ${state.inputMode === 'board' ? `<button class="${APP_ID}-btn" data-action="connect">Verbinden</button>` : ''}
               <button class="${APP_ID}-btn" data-action="minimize">×</button>
             </div>
           </div>
+          ${state.notice || storageWarning ? `<div class="${APP_ID}-hint" role="status">${escapeHtml(state.notice)} ${escapeHtml(storageWarning)}</div>` : ''}
           ${state.screen === 'game' ? gameHtml() : setupHtml()}
+          ${state.inputMode === 'board' ? `<details data-details="diagnostics" style="margin-top:16px"><summary>Verbindungsdiagnose</summary><div class="${APP_ID}-hint">${escapeHtml(connectionStatus)}<br>Adresse: ${escapeHtml(state.boardHost)}<br>Letztes Ereignis: ${escapeHtml(lastEvent)}<br>Gemeldete Darts: ${lastBoard ? lastBoard.throws.length : '–'}</div></details>` : ''}
         </div>
       `;
 
       bindUi(panel);
+      for (const [key, open] of detailStates) { const detail = panel.querySelector(`[data-details="${key}"]`); if (detail) detail.open = open; }
+      const replacement = focusId ? document.getElementById(focusId) : focusPlayer != null ? panel.querySelector(`[data-player-name="${focusPlayer}"]`) : null;
+      if (replacement && selection) { replacement.focus(); replacement.setSelectionRange(...selection); }
     });
   }
 
   function bindUi(panel) {
+    panel.querySelectorAll('[data-mode]').forEach((button) => {
+      button.addEventListener('click', () => {
+        if (state.screen !== 'setup') return;
+        state.inputMode = button.dataset.mode === 'test' ? 'test' : 'board';
+        disconnectBoard();
+        if (state.inputMode === 'board') connectBoard();
+        update();
+      });
+    });
+    panel.querySelectorAll('[data-correct]').forEach((select) => {
+      select.addEventListener('change', () => { select.blur(); correctThrow(Number(select.dataset.correct), select.value); });
+      select.addEventListener('blur', () => render());
+    });
     panel.querySelectorAll('[data-bull]').forEach((button) => {
       button.addEventListener('click', () => {
         state.bullMode = button.dataset.bull;
@@ -527,17 +683,17 @@
     });
 
     panel.querySelectorAll('[data-player-name]').forEach((input) => {
-      input.addEventListener('change', () => {
+      input.addEventListener('input', () => {
         const index = Number(input.dataset.playerName);
-        if (state.players[index]) state.players[index].name = input.value.trim() || `Spieler ${index + 1}`;
+        if (state.players[index]) state.players[index].name = input.value;
         saveState();
       });
     });
 
     const host = panel.querySelector(`#${APP_ID}-host`);
     if (host) {
-      host.addEventListener('change', () => {
-        state.boardHost = host.value.trim() || DEFAULT_BOARD_HOST;
+      host.addEventListener('input', () => {
+        state.boardHost = host.value;
         saveState();
       });
     }
@@ -553,6 +709,7 @@
         }
         if (action === 'undo') undo();
         if (action === 'next') nextPlayer();
+        if (action === 'resume') resumeBoard();
         if (action === 'new-game') newGame();
         if (action === 'connect') {
           if (host) state.boardHost = host.value.trim() || DEFAULT_BOARD_HOST;
