@@ -1,0 +1,263 @@
+from pathlib import Path
+import json
+
+path = Path('autodarts-random-cutthroat.user.js')
+text = path.read_text()
+if "const VERSION = '0.3.0';" in text:
+    print('UI v0.3.0 already applied')
+    raise SystemExit(0)
+
+text = text.replace('// @version      0.2.0', '// @version      0.3.0', 1)
+text = text.replace("const VERSION = '0.2.0';", "const VERSION = '0.3.0';", 1)
+
+ui_block = r'''  function remainingMarks(player, target) {
+    return Math.max(0, 3 - getMarks(player, target));
+  }
+
+  function dartboardSvg() {
+    const order = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5];
+    const current = state.players[state.currentPlayer];
+    const targetSet = new Set(state.targets);
+    const cx = 260;
+    const cy = 260;
+    const polar = (r, deg) => {
+      const rad = deg * Math.PI / 180;
+      return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+    };
+    const sectorPath = (r1, r2, startDeg, endDeg) => {
+      const [a1x, a1y] = polar(r2, startDeg);
+      const [a2x, a2y] = polar(r2, endDeg);
+      const [b2x, b2y] = polar(r1, endDeg);
+      const [b1x, b1y] = polar(r1, startDeg);
+      return `M ${a1x.toFixed(2)} ${a1y.toFixed(2)} A ${r2} ${r2} 0 0 1 ${a2x.toFixed(2)} ${a2y.toFixed(2)} L ${b2x.toFixed(2)} ${b2y.toFixed(2)} A ${r1} ${r1} 0 0 0 ${b1x.toFixed(2)} ${b1y.toFixed(2)} Z`;
+    };
+
+    const wedges = order.map((number, i) => {
+      const center = -90 + i * 18;
+      const start = center - 9;
+      const end = center + 9;
+      const even = i % 2 === 0;
+      const base = even ? '#f3ead9' : '#26313b';
+      const ring = even ? '#c63f3a' : '#2c8a52';
+      const isTarget = targetSet.has(number);
+      const closed = isTarget && current && getMarks(current, number) >= 3;
+      const overlay = isTarget ? `<path d="${sectorPath(34, 190, start, end)}" fill="${closed ? 'rgba(22,163,74,.18)' : 'rgba(245,158,11,.24)'}" stroke="${closed ? '#16a34a' : '#f59e0b'}" stroke-width="${closed ? 2 : 4}"/>` : '';
+      return `
+        <path d="${sectorPath(34, 190, start, end)}" fill="${base}" stroke="#d9dee7" stroke-width="1"/>
+        <path d="${sectorPath(112, 126, start, end)}" fill="${ring}" stroke="#e7ebf0" stroke-width="1"/>
+        <path d="${sectorPath(174, 190, start, end)}" fill="${ring}" stroke="#e7ebf0" stroke-width="1"/>
+        ${overlay}`;
+    }).join('');
+
+    const numbers = order.map((number, i) => {
+      const angle = -90 + i * 18;
+      const [x, y] = polar(220, angle);
+      const isTarget = targetSet.has(number);
+      const closed = isTarget && current && getMarks(current, number) >= 3;
+      const size = isTarget && !closed ? 30 : isTarget ? 23 : 17;
+      const fill = isTarget && !closed ? '#b45309' : closed ? '#16a34a' : '#667085';
+      const weight = isTarget ? 900 : 700;
+      return `<text x="${x.toFixed(1)}" y="${(y + 6).toFixed(1)}" text-anchor="middle" font-size="${size}" font-weight="${weight}" fill="${fill}">${number}</text>`;
+    }).join('');
+
+    const bullTarget = targetSet.has(25);
+    const bullClosed = bullTarget && current && getMarks(current, 25) >= 3;
+    const bullStroke = bullTarget ? (bullClosed ? '#16a34a' : '#f59e0b') : '#d9dee7';
+    return `
+      <svg class="${APP_ID}-board-svg" viewBox="0 0 520 520" role="img" aria-label="Dartscheibe mit hervorgehobenen Cricket-Zielen">
+        <circle cx="260" cy="260" r="246" fill="#ffffff" stroke="#dce2ea" stroke-width="3"/>
+        <circle cx="260" cy="260" r="196" fill="#111827" stroke="#111827" stroke-width="2"/>
+        ${wedges}
+        <circle cx="260" cy="260" r="34" fill="#2c8a52" stroke="#eef1f5" stroke-width="2"/>
+        <circle cx="260" cy="260" r="15" fill="#c63f3a" stroke="${bullStroke}" stroke-width="${bullTarget ? 5 : 2}"/>
+        ${bullTarget ? `<circle cx="260" cy="260" r="39" fill="none" stroke="${bullStroke}" stroke-width="${bullClosed ? 3 : 5}"/>` : ''}
+        ${numbers}
+      </svg>`;
+  }
+
+  function injectStyles() {
+    if (document.getElementById(`${APP_ID}-style`)) return;
+    const style = document.createElement('style');
+    style.id = `${APP_ID}-style`;
+    style.textContent = `
+      :root{--${APP_ID}-bg:#f4f7fb;--${APP_ID}-text:#172033;--${APP_ID}-muted:#697386;--${APP_ID}-line:#dfe5ec;--${APP_ID}-accent:#f59e0b;--${APP_ID}-green:#16a34a}
+      #${APP_ID}-launcher{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:1px solid #dfe5ec;border-radius:999px;padding:13px 18px;font:800 14px/1 system-ui,-apple-system,sans-serif;cursor:pointer;background:#fff;color:#172033;box-shadow:0 10px 32px #25324a33}
+      #${APP_ID}-panel{position:fixed;inset:10px;z-index:2147483645;background:var(--${APP_ID}-bg);color:var(--${APP_ID}-text);border:1px solid #d7dee7;border-radius:22px;box-shadow:0 24px 80px #23324a33;overflow:auto;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      #${APP_ID}-panel.${APP_ID}-hidden{display:none}#${APP_ID}-panel *{box-sizing:border-box}
+      .${APP_ID}-wrap{max-width:1500px;margin:0 auto;padding:18px 22px 28px}
+      .${APP_ID}-top{position:sticky;top:0;z-index:4;display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-18px -22px 18px;padding:15px 22px;background:#f4f7fbf2;border-bottom:1px solid #e1e6ed;backdrop-filter:blur(14px)}
+      .${APP_ID}-title{display:flex;align-items:center;gap:10px;font-size:22px;font-weight:900;color:#172033}
+      .${APP_ID}-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:6px 10px;border-radius:999px;background:#fff;color:#5d6878;border:1px solid #dfe5ec;font-weight:800}
+      .${APP_ID}-dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:#dc4c4c}.connected .${APP_ID}-dot{background:#22a95a}
+      .${APP_ID}-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+      #${APP_ID}-panel button,#${APP_ID}-panel input,#${APP_ID}-panel select{font:inherit}#${APP_ID}-panel button:disabled{opacity:.42;cursor:not-allowed}
+      #${APP_ID}-panel select{max-width:100%;background:#fff;color:#172033;border:1px solid #cfd7e2;border-radius:10px;padding:8px 10px}
+      .${APP_ID}-btn{border:1px solid #cfd7e2;background:#fff;color:#263449;border-radius:12px;padding:10px 13px;cursor:pointer;font-weight:800;box-shadow:0 1px 2px #23324a0d}
+      .${APP_ID}-btn:hover{background:#f8fafc}.primary{background:#f59e0b;border-color:#f59e0b;color:#402b00}.primary:hover{background:#fbbf24}.danger{color:#a73535;border-color:#e7b7b7;background:#fffafa}
+      .${APP_ID}-grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+      .${APP_ID}-card{background:#fff;border:1px solid #dde4ec;border-radius:18px;padding:17px;box-shadow:0 4px 18px #23324a0b}
+      .${APP_ID}-card h3{margin:0 0 12px;font-size:15px;color:#4a5668}. ${APP_ID}-seg{display:flex;gap:8px;flex-wrap:wrap}
+      .${APP_ID}-seg button{border:1px solid #d4dce6;background:#fff;color:#586476;border-radius:10px;padding:9px 12px;cursor:pointer}. ${APP_ID}-seg button.active{background:#fff0c7;color:#7a4a00;border-color:#f3b94c;font-weight:900}
+      .${APP_ID}-players{display:grid;gap:8px}. ${APP_ID}-player-row{display:flex;gap:8px}. ${APP_ID}-player-row input,.${APP_ID}-input{width:100%;border:1px solid #cfd7e2;background:#fff;color:#172033;border-radius:10px;padding:10px 12px;outline:none}. ${APP_ID}-player-row input:focus,.${APP_ID}-input:focus{border-color:#f59e0b;box-shadow:0 0 0 3px #f59e0b22}
+      .${APP_ID}-hint{font-size:12px;color:#697386;line-height:1.5;margin-top:8px}
+      .${APP_ID}-game-layout{display:grid;grid-template-columns:minmax(330px,.82fr) minmax(520px,1.7fr);gap:18px;align-items:start}
+      .${APP_ID}-board-card{position:sticky;top:76px;background:#fff;border:1px solid #dde4ec;border-radius:22px;padding:16px;box-shadow:0 8px 28px #23324a12}
+      .${APP_ID}-status{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 14px;border-radius:14px;background:#eef4fb;border:1px solid #d8e4f2;margin-bottom:12px}. ${APP_ID}-status strong{font-size:18px}. ${APP_ID}-status.takeout{background:#fff3d8;border-color:#f6ca6a}. ${APP_ID}-status.sync{background:#fff0f0;border-color:#efb6b6}
+      .${APP_ID}-board-wrap{display:flex;justify-content:center;align-items:center}. ${APP_ID}-board-svg{display:block;width:min(100%,470px);height:auto;filter:drop-shadow(0 8px 13px #23324a18)}
+      .${APP_ID}-legend{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:6px;font-size:12px;color:#697386}. ${APP_ID}-legend span{display:inline-flex;align-items:center;gap:5px}. ${APP_ID}-swatch{width:10px;height:10px;border-radius:3px;display:inline-block;background:#f59e0b}. ${APP_ID}-swatch.closed{background:#16a34a}
+      .${APP_ID}-visit{margin-top:13px;padding-top:13px;border-top:1px solid #e5e9ef}. ${APP_ID}-visit-title{font-size:12px;font-weight:900;color:#697386;text-transform:uppercase;letter-spacing:.06em}. ${APP_ID}-throw-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}. ${APP_ID}-throw{display:flex;align-items:center;justify-content:center;min-height:54px;border-radius:13px;background:#f7f9fc;border:1px solid #dde4ec;font-size:22px;font-weight:900;color:#23324a}. ${APP_ID}-throw.used{background:#fff5df;border-color:#f5c968;color:#8a5200}
+      .${APP_ID}-game-main{display:grid;gap:14px}. ${APP_ID}-player-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}. ${APP_ID}-player-card{background:#fff;border:1px solid #dde4ec;border-radius:16px;padding:13px 14px;min-width:0}. ${APP_ID}-player-card.active{border:2px solid #f59e0b;background:#fff8e8;box-shadow:0 5px 18px #f59e0b1f}. ${APP_ID}-player-name{font-size:16px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}. ${APP_ID}-player-score{font-size:32px;font-weight:950;line-height:1;margin-top:7px;color:#172033}. ${APP_ID}-player-progress{font-size:12px;color:#697386;margin-top:6px}
+      .${APP_ID}-needed-card{background:#fff;border:1px solid #dde4ec;border-radius:20px;padding:16px}. ${APP_ID}-needed-head{display:flex;justify-content:space-between;align-items:end;gap:10px;margin-bottom:12px}. ${APP_ID}-needed-head h2{margin:0;font-size:20px}. ${APP_ID}-needed-head span{font-size:12px;color:#697386}
+      .${APP_ID}-targets{display:grid;grid-template-columns:repeat(7,minmax(86px,1fr));gap:9px;margin:0}. ${APP_ID}-target{position:relative;min-height:104px;border-radius:16px;padding:10px;background:#fff4d6;border:2px solid #f2bd52;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center}. ${APP_ID}-target.closed{background:#f2f5f7;border-color:#d9e0e8;color:#8993a3}. ${APP_ID}-target-number{font-size:42px;line-height:.95;font-weight:950;letter-spacing:-.04em}. ${APP_ID}-target.open .${APP_ID}-target-number{font-size:50px;color:#9a5b00}. ${APP_ID}-target-mark{font-size:24px;line-height:1;margin-top:7px;font-weight:900}. ${APP_ID}-target-remaining{font-size:11px;font-weight:800;margin-top:6px;color:#697386}. ${APP_ID}-target.open .${APP_ID}-target-remaining{color:#9a5b00}
+      .${APP_ID}-score-card{background:#fff;border:1px solid #dde4ec;border-radius:20px;padding:12px 14px 14px;overflow:auto}. ${APP_ID}-score-card h3{margin:3px 2px 8px;font-size:15px;color:#4a5668}
+      .${APP_ID}-scoreboard{width:100%;border-collapse:separate;border-spacing:0 6px;min-width:520px}. ${APP_ID}-scoreboard th{font-size:13px;color:#697386;padding:6px 8px}. ${APP_ID}-scoreboard td{background:#f8fafc;border-top:1px solid #e3e8ef;border-bottom:1px solid #e3e8ef;padding:10px 8px;text-align:center;font-weight:850}. ${APP_ID}-scoreboard td:first-child{border-radius:11px 0 0 11px;border-left:1px solid #e3e8ef;text-align:left}. ${APP_ID}-scoreboard td:last-child{border-radius:0 11px 11px 0;border-right:1px solid #e3e8ef}. ${APP_ID}-scoreboard .active-player{background:#fff5df;border-color:#f1c970}. ${APP_ID}-marks{font-size:25px;letter-spacing:1px}. ${APP_ID}-closed{color:#16a34a}. ${APP_ID}-score{font-size:26px}. ${APP_ID}-row-target{font-size:20px;font-weight:950;color:#657185}. ${APP_ID}-row-target.needed{font-size:29px;color:#9a5b00;background:#fff7e8;border-color:#f4cf84}
+      .${APP_ID}-winner{margin:10px 0 16px;padding:18px;border-radius:18px;background:#eaf8ef;border:1px solid #8bd0a2;font-size:23px;font-weight:950;text-align:center;color:#176a34}
+      .${APP_ID}-test{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}. ${APP_ID}-test button{padding:8px 10px;font-size:12px}
+      @media(max-width:1050px){.${APP_ID}-game-layout{grid-template-columns:1fr}. ${APP_ID}-board-card{position:relative;top:auto}. ${APP_ID}-board-svg{width:min(100%,390px)}. ${APP_ID}-targets{grid-template-columns:repeat(4,minmax(80px,1fr))}}
+      @media(max-width:760px){#${APP_ID}-panel{inset:4px;border-radius:14px}. ${APP_ID}-wrap{padding:12px}. ${APP_ID}-top{margin:-12px -12px 12px;padding:12px}. ${APP_ID}-grid2{grid-template-columns:1fr}. ${APP_ID}-top{align-items:flex-start}. ${APP_ID}-title{font-size:18px}. ${APP_ID}-targets{grid-template-columns:repeat(2,minmax(0,1fr))}. ${APP_ID}-target{min-height:86px}. ${APP_ID}-target-number,.${APP_ID}-target.open .${APP_ID}-target-number{font-size:38px}. ${APP_ID}-player-strip{grid-template-columns:repeat(2,minmax(0,1fr))}. ${APP_ID}-scoreboard{font-size:12px}. ${APP_ID}-scoreboard td{padding:9px 5px}. ${APP_ID}-row-target.needed{font-size:24px}}
+    `;
+    document.head.appendChild(style);
+  }
+'''
+
+start = text.index('  function injectStyles() {')
+end = text.index('\n\n  function ensureUi()', start)
+text = text[:start] + ui_block + text[end:]
+
+game_block = r'''  function gameHtml() {
+    const current = state.players[state.currentPlayer];
+    const statusClass = state.boardGate === 'sync' ? 'sync' : (takingOut || state.turnDarts >= 3 ? 'takeout' : '');
+    const statusText = state.winner !== null ? `${state.players[state.winner].name} gewinnt!`
+      : state.boardGate === 'sync' ? 'Aufnahme synchronisieren'
+      : state.inputMode === 'board' && state.boardGate === 'await-empty' ? 'Board leeren'
+      : takingOut || state.turnDarts >= 3 ? 'Darts herausziehen'
+      : `${current?.name || 'Spieler'} ist dran`;
+
+    const headers = state.players.map((player, index) => `<th>${escapeHtml(player.name)}${index === state.currentPlayer ? ' 🎯' : ''}</th>`).join('');
+    const targetRows = state.targets.map((target) => {
+      const cells = state.players.map((player, index) => {
+        const marks = getMarks(player, target);
+        const cls = `${index === state.currentPlayer ? 'active-player ' : ''}${marks >= 3 ? `${APP_ID}-closed` : ''}`;
+        return `<td class="${cls}"><span class="${APP_ID}-marks">${MARKS[marks]}</span></td>`;
+      }).join('');
+      const needed = current && remainingMarks(current, target) > 0;
+      return `<tr><td class="${APP_ID}-row-target ${needed ? 'needed' : ''}">${targetLabel(target)}</td>${cells}</tr>`;
+    }).join('');
+
+    const scoreCells = state.players.map((player, index) => `<td class="${index === state.currentPlayer ? 'active-player' : ''}"><span class="${APP_ID}-score">${player.score}</span></td>`).join('');
+    const winner = state.winner !== null ? `<div class="${APP_ID}-winner">🏆 ${escapeHtml(state.players[state.winner].name)} gewinnt!</div>` : '';
+    const visitEditable = state.boardGate === 'ready' && !takingOut && !state.legacyVisit;
+    const canUndo = visitEditable && state.visit?.throws.some((_, i) => effectiveThrow(i) !== null);
+    const choices = ['MISS', ...Array.from({ length: 20 }, (_, i) => i + 1).flatMap((n) => ['S', 'D', 'T'].map((m) => `${m}${n}`)), 'S25', 'D25'];
+    const corrections = (state.visit?.throws || []).map((segment, i) => {
+      const selected = Object.hasOwn(state.visit.overrides, i) ? (effectiveThrow(i)?.name || 'ignore') : 'board';
+      return `<label>Dart ${i + 1}: <select data-correct="${i}" aria-label="Dart ${i + 1} korrigieren" ${visitEditable ? '' : 'disabled'}>
+        <option value="board" ${selected === 'board' ? 'selected' : ''}>${escapeHtml(segment.name)} (Original)</option>
+        <option value="ignore" ${selected === 'ignore' ? 'selected' : ''}>Gestrichen</option>
+        ${choices.map((value) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${value}</option>`).join('')}
+      </select></label>`;
+    }).join(' ');
+    const canResume = state.connected && boardOperational(lastBoard) && !state.legacyVisit && !takingOut
+      && (lastBoard.throws.length > 0 || !state.visit?.throws.length);
+
+    const playerCards = state.players.map((player, index) => {
+      const closed = state.targets.filter((target) => getMarks(player, target) >= 3).length;
+      return `<div class="${APP_ID}-player-card ${index === state.currentPlayer ? 'active' : ''}">
+        <div class="${APP_ID}-player-name">${index === state.currentPlayer ? '🎯 ' : ''}${escapeHtml(player.name)}</div>
+        <div class="${APP_ID}-player-score">${player.score}</div>
+        <div class="${APP_ID}-player-progress">${closed}/7 Ziele geschlossen</div>
+      </div>`;
+    }).join('');
+
+    const targetCards = state.targets.map((target) => {
+      const marks = current ? getMarks(current, target) : 0;
+      const remaining = Math.max(0, 3 - marks);
+      const closed = remaining === 0;
+      return `<div class="${APP_ID}-target ${closed ? 'closed' : 'open'}">
+        <div class="${APP_ID}-target-number">${targetLabel(target)}</div>
+        <div class="${APP_ID}-target-mark">${MARKS[marks]}</div>
+        <div class="${APP_ID}-target-remaining">${closed ? 'geschlossen' : `noch ${remaining} ${remaining === 1 ? 'Mark' : 'Marks'}`}</div>
+      </div>`;
+    }).join('');
+
+    const throws = [0, 1, 2].map((i) => {
+      const segment = state.visit && i < state.visit.throws.length ? effectiveThrow(i) : null;
+      return `<div class="${APP_ID}-throw ${i < state.turnDarts ? 'used' : ''}">${escapeHtml(segment?.name || '—')}</div>`;
+    }).join('');
+
+    return `
+      ${winner}
+      ${state.inputMode === 'board' && state.boardGate === 'sync' ? `<div class="${APP_ID}-card" role="status" style="margin-bottom:14px">
+        <b>Aufnahme synchronisieren</b>
+        <p>${lastBoard ? `Board meldet: ${lastBoard.throws.map((s) => escapeHtml(s.name)).join(', ') || 'keine Darts'}.` : 'Auf eine gültige Board-Meldung warten.'}</p>
+        <div class="${APP_ID}-hint">Nur fortsetzen, wenn die gemeldeten Darts zur aktuellen Aufnahme gehören. Bei bereits entnommenen Darts die Aufnahme abschließen.</div>
+        <button class="${APP_ID}-btn" data-action="resume" ${canResume ? '' : 'disabled'}>${lastBoard?.throws.length ? 'Aufnahme für aktuellen Spieler übernehmen' : 'Mit leerem Board fortsetzen'}</button>
+      </div>` : ''}
+      <div class="${APP_ID}-game-layout">
+        <section class="${APP_ID}-board-card">
+          <div class="${APP_ID}-status ${statusClass}" role="status">
+            <strong>${escapeHtml(statusText)}</strong>
+            <span>${state.turnDarts}/3 Darts</span>
+          </div>
+          <div class="${APP_ID}-board-wrap">${dartboardSvg()}</div>
+          <div class="${APP_ID}-legend"><span><i class="${APP_ID}-swatch"></i>noch benötigt</span><span><i class="${APP_ID}-swatch closed"></i>geschlossen</span></div>
+          <div class="${APP_ID}-visit">
+            <div class="${APP_ID}-visit-title">Aktuelle Aufnahme</div>
+            <div class="${APP_ID}-throw-row">${throws}</div>
+          </div>
+        </section>
+        <section class="${APP_ID}-game-main">
+          <div class="${APP_ID}-player-strip">${playerCards}</div>
+          <div class="${APP_ID}-needed-card">
+            <div class="${APP_ID}-needed-head"><h2>Noch benötigt – ${escapeHtml(current?.name || '')}</h2><span>3 Marks schließen ein Ziel</span></div>
+            <div class="${APP_ID}-targets">${targetCards}</div>
+          </div>
+          <div class="${APP_ID}-score-card">
+            <h3>Spielstand</h3>
+            <table class="${APP_ID}-scoreboard">
+              <thead><tr><th>Ziel</th>${headers}</tr></thead>
+              <tbody>${targetRows}<tr><td class="${APP_ID}-row-target">Punkte</td>${scoreCells}</tr></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+      <div class="${APP_ID}-actions" style="margin-top:14px">
+        <button class="${APP_ID}-btn" data-action="undo" ${canUndo ? '' : 'disabled'}>${state.inputMode === 'test' ? '↶ Undo' : 'Letzten Dart streichen'}</button>
+        <button class="${APP_ID}-btn" data-action="next" ${state.winner !== null || (state.inputMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
+        <button class="${APP_ID}-btn danger" data-action="new-game">Neues Spiel</button>
+      </div>
+      <div class="${APP_ID}-test">${corrections}</div>
+      ${state.inputMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Bei Fehlwürfen außerhalb des Boards im Board Manager einen MISS ergänzen.</div>` : ''}
+      ${state.inputMode === 'test' ? `<details open data-details="tests" style="margin-top:14px;color:#697386">
+        <summary style="cursor:pointer">Testwürfe (ohne Board)</summary>
+        <div class="${APP_ID}-test">
+          ${state.targets.flatMap((target) => (target === 25 ? [1,2] : [1,2,3]).map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
+          <button class="${APP_ID}-btn" data-test-target="0" data-test-m="0" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>MISS</button>
+        </div>
+      </details>` : ''}
+    `;
+  }
+'''
+
+start = text.index('  function gameHtml() {')
+end = text.index('\n\n  function render()', start)
+text = text[:start] + game_block + text[end:]
+path.write_text(text)
+
+package_path = Path('package.json')
+package = json.loads(package_path.read_text())
+package['version'] = '0.3.0'
+package_path.write_text(json.dumps(package, indent=2, ensure_ascii=False) + '\n')
+
+changelog = Path('CHANGELOG.md')
+ctext = changelog.read_text()
+entry = """## 0.3.0 – 2026-09-10\n\n- Helles, TV-taugliches Spielinterface mit deutlich größeren offenen Zielzahlen.\n- Grafische Dartscheibe mit hervorgehobenen Random-Cricket-Zielen; geschlossene Ziele werden separat markiert.\n- Neue Spieler-Karten, aktuelle Drei-Dart-Anzeige und klarer Status für Spieler am Board, Takeout und Synchronisierung.\n- Die bestehende Spiel- und Board-Manager-Logik bleibt unverändert.\n\n"""
+if '## 0.3.0' not in ctext:
+    changelog.write_text(ctext.replace('# Changelog\n\n', '# Changelog\n\n' + entry, 1))
+
+readme = Path('README.md')
+rtext = readme.read_text()
+old = '**Version 0.2.0:** Windows-Voreinstellung, vollständige Aufnahmen, Wurfkorrekturen und ein eigener Testmodus ohne Kameras.'
+new = '**Version 0.3.0:** Helles, TV-taugliches Spielinterface mit Dartscheibe und großen offenen Zielzahlen. Die Windows-/Board-Manager-Funktionen aus 0.2.0 bleiben erhalten.'
+if old in rtext:
+    readme.write_text(rtext.replace(old, new, 1))
