@@ -1,0 +1,38 @@
+name: Random Cutthroat player-back update
+
+on:
+  push:
+    paths:
+      - '.github/workflows/turn-back-one-shot.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Apply patch
+        run: python scripts/turn-back-patch.py
+      - name: Syntax check
+        run: npm run check
+      - name: Regression tests
+        run: npm test
+      - name: Commit changes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add autodarts-random-cutthroat.user.js tests/game.test.cjs package.json CHANGELOG.md README.md
+          git commit -m "Allow previous player and reset current visit"
+          git push
