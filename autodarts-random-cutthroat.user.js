@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts Random Cutthroat Cricket
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.3.0
+// @version      0.3.1
 // @description  Random Cutthroat Cricket overlay for Autodarts. 7 random targets, Bull always/never/random, local Board Manager scoring.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -17,7 +17,7 @@
   const APP_ID = 'ad-rcc';
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.3.0';
+  const VERSION = '0.3.1';
   const MARKS = ['–', '/', 'X', '⊗'];
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const defaultState = () => ({
@@ -25,7 +25,7 @@
     players: [1, 2].map((i) => ({ name: `Spieler ${i}`, marks: {}, score: 0 })),
     currentPlayer: 0, turnDarts: 0, turnSerial: 0, winner: null,
     boardHost: DEFAULT_BOARD_HOST, inputMode: 'board', connected: false,
-    boardGate: 'await-empty', visit: null, legacyVisit: false, minimized: false, notice: '',
+    boardGate: 'await-empty', visit: null, previousVisit: null, legacyVisit: false, minimized: false, notice: '',
   });
 
   let state = loadState();
@@ -79,6 +79,8 @@
       loaded.boardGate = loaded.screen === 'game' ? 'sync' : 'await-empty';
       if (saved.schemaVersion === 2 && saved.boardGate === 'finished' && loaded.winner !== null) loaded.boardGate = 'finished';
       if (loaded.inputMode === 'test' && loaded.visit) loaded.boardGate = 'ready';
+      loaded.previousVisit = validTurnSnapshot(saved.previousVisit, loaded.players.length) ? saved.previousVisit : null;
+      if (loaded.screen !== 'game') loaded.previousVisit = null;
       delete loaded.history;
       delete loaded.lastProcessedFingerprint;
       return loaded;
@@ -94,6 +96,14 @@
       && visit.base.currentPlayer === playerIndex && Array.isArray(visit.throws) && visit.throws.length <= 3
       && visit.throws.every((s) => normalizeSegment(s)) && visit.overrides && typeof visit.overrides === 'object'
       && Object.entries(visit.overrides).every(([i, s]) => /^\d$/.test(i) && Number(i) < visit.throws.length && (s === null || normalizeSegment(s)));
+  }
+
+  function validTurnSnapshot(snapshot, playerCount) {
+    return snapshot && validPlayers(snapshot.players) && snapshot.players.length === playerCount
+      && Number.isInteger(snapshot.currentPlayer) && snapshot.currentPlayer >= 0 && snapshot.currentPlayer < playerCount
+      && Number.isInteger(snapshot.turnSerial) && snapshot.turnSerial >= 0
+      && (snapshot.winner === null || (Number.isInteger(snapshot.winner) && snapshot.winner >= 0 && snapshot.winner < playerCount))
+      && validVisit(snapshot.visit, playerCount, snapshot.currentPlayer);
   }
 
   function saveState() {
@@ -201,15 +211,57 @@
     replayVisit();
     update();
   }
+  function snapshotCurrentTurn() {
+    return {
+      players: clone(state.players), currentPlayer: state.currentPlayer, visit: clone(state.visit),
+      turnDarts: state.turnDarts, turnSerial: state.turnSerial, winner: state.winner,
+    };
+  }
   function nextPlayer() {
     if (state.screen !== 'game' || state.winner !== null) return;
     // A manual change waits for the physical takeout; repeated clicks cannot skip players.
     if (state.inputMode === 'board' && state.boardGate === 'await-empty') return;
+    if (state.visit && !state.legacyVisit) state.previousVisit = snapshotCurrentTurn();
     state.currentPlayer = (state.currentPlayer + 1) % state.players.length;
     state.turnSerial += 1;
     beginVisit();
     state.boardGate = state.inputMode === 'board' ? 'await-empty' : 'ready';
     state.notice = '';
+    update();
+  }
+  function previousPlayer() {
+    if (state.screen !== 'game' || !validTurnSnapshot(state.previousVisit, state.players.length) || takingOut) return;
+    if (state.visit?.throws?.length) {
+      state.notice = 'Der aktuelle Spieler hat bereits Würfe. Diese Aufnahme zuerst zurücksetzen oder korrigieren.';
+      update();
+      return;
+    }
+    const snapshot = clone(state.previousVisit);
+    state.players = snapshot.players;
+    state.currentPlayer = snapshot.currentPlayer;
+    state.visit = snapshot.visit;
+    state.turnDarts = snapshot.turnDarts;
+    state.turnSerial = snapshot.turnSerial;
+    state.winner = snapshot.winner;
+    state.previousVisit = null;
+    state.legacyVisit = false;
+    takingOut = false;
+    state.boardGate = state.inputMode === 'board' ? 'review' : 'ready';
+    state.notice = 'Vorherige Aufnahme geöffnet. Würfe korrigieren oder zurücksetzen und danach mit „Nächster Spieler“ fortfahren.';
+    update();
+  }
+  function resetVisit() {
+    if (state.screen !== 'game' || !state.visit || state.legacyVisit || takingOut || !['ready', 'review'].includes(state.boardGate)) return;
+    if (state.inputMode === 'test') {
+      state.visit.throws = [];
+      state.visit.overrides = {};
+      replayVisit();
+      state.notice = 'Aktuelle Würfe zurückgesetzt.';
+    } else {
+      state.visit.throws.forEach((_, i) => { state.visit.overrides[i] = null; });
+      replayVisit();
+      state.notice = 'Wertung dieser Aufnahme zurückgesetzt. Erkannte Wurfplätze bleiben belegt und können unten einzeln korrigiert werden.';
+    }
     update();
   }
   function undo() {
@@ -219,7 +271,7 @@
       delete state.visit.overrides[state.visit.throws.length];
     }
     else {
-      if (state.boardGate !== 'ready' || takingOut) return;
+      if (!['ready', 'review'].includes(state.boardGate) || takingOut) return;
       const index = state.visit.throws.findLastIndex((_, i) => effectiveThrow(i) !== null);
       if (index < 0) return;
       // Keep the physical slot occupied so the next snapshot cannot add this dart again.
@@ -229,7 +281,7 @@
     update();
   }
   function correctThrow(index, value) {
-    if (!state.visit || state.legacyVisit || state.boardGate !== 'ready' || takingOut || !Number.isInteger(index) || index < 0 || index >= state.visit.throws.length) return;
+    if (!state.visit || state.legacyVisit || !['ready', 'review'].includes(state.boardGate) || takingOut || !Number.isInteger(index) || index < 0 || index >= state.visit.throws.length) return;
     if (value === 'board') delete state.visit.overrides[index];
     else {
       const segment = value === 'ignore' ? null : normalizeSegment({ name: value });
@@ -247,6 +299,7 @@
     state.currentPlayer = 0;
     state.turnSerial = 0;
     state.winner = null;
+    state.previousVisit = null;
     state.screen = 'game';
     state.notice = '';
     beginVisit();
@@ -260,6 +313,7 @@
     state.screen = 'setup';
     state.winner = null;
     state.visit = null;
+    state.previousVisit = null;
     state.turnDarts = 0;
     state.legacyVisit = false;
     state.notice = '';
@@ -303,7 +357,7 @@
     connectionStatus = state.inputMode === 'test' ? 'Testmodus – ohne Kameras' : 'Nicht verbunden';
   }
   function blockForSync(message) {
-    if (state.screen === 'game' && state.inputMode === 'board' && !['await-empty', 'finished'].includes(state.boardGate)) {
+    if (state.screen === 'game' && state.inputMode === 'board' && !['await-empty', 'finished', 'review'].includes(state.boardGate)) {
       state.boardGate = 'sync';
       state.notice = message;
     }
@@ -390,6 +444,7 @@
     lastBoard = board;
     connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
     if (state.screen !== 'game' || state.boardGate === 'finished') { render(); return; }
+    if (state.boardGate === 'review') { render(); return; }
     if (!boardOperational(board)) {
       blockForSync('Die Erkennung wurde angehalten oder neu gestartet. Board und Aufnahme vor dem Fortsetzen prüfen.');
       update();
@@ -537,7 +592,7 @@
       .${APP_ID}-hint{font-size:12px;color:#697386;line-height:1.5;margin-top:8px}
       .${APP_ID}-game-layout{display:grid;grid-template-columns:minmax(330px,.82fr) minmax(520px,1.7fr);gap:18px;align-items:start}
       .${APP_ID}-board-card{position:sticky;top:76px;background:#fff;border:1px solid #dde4ec;border-radius:22px;padding:16px;box-shadow:0 8px 28px #23324a12}
-      .${APP_ID}-status{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 14px;border-radius:14px;background:#eef4fb;border:1px solid #d8e4f2;margin-bottom:12px}.${APP_ID}-status strong{font-size:18px}.${APP_ID}-status.takeout{background:#fff3d8;border-color:#f6ca6a}.${APP_ID}-status.sync{background:#fff0f0;border-color:#efb6b6}
+      .${APP_ID}-status{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 14px;border-radius:14px;background:#eef4fb;border:1px solid #d8e4f2;margin-bottom:12px}.${APP_ID}-status strong{font-size:18px}.${APP_ID}-status.takeout{background:#fff3d8;border-color:#f6ca6a}.${APP_ID}-status.sync{background:#fff0f0;border-color:#efb6b6}.${APP_ID}-status.review{background:#eef6ff;border-color:#9fc8f4}
       .${APP_ID}-board-wrap{display:flex;justify-content:center;align-items:center}.${APP_ID}-board-svg{display:block;width:min(100%,470px);height:auto;filter:drop-shadow(0 8px 13px #23324a18)}
       .${APP_ID}-legend{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:6px;font-size:12px;color:#697386}.${APP_ID}-legend span{display:inline-flex;align-items:center;gap:5px}.${APP_ID}-swatch{width:10px;height:10px;border-radius:3px;display:inline-block;background:#f59e0b}.${APP_ID}-swatch.closed{background:#16a34a}
       .${APP_ID}-visit{margin-top:13px;padding-top:13px;border-top:1px solid #e5e9ef}.${APP_ID}-visit-title{font-size:12px;font-weight:900;color:#697386;text-transform:uppercase;letter-spacing:.06em}.${APP_ID}-throw-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}.${APP_ID}-throw{display:flex;align-items:center;justify-content:center;min-height:54px;border-radius:13px;background:#f7f9fc;border:1px solid #dde4ec;font-size:22px;font-weight:900;color:#23324a}.${APP_ID}-throw.used{background:#fff5df;border-color:#f5c968;color:#8a5200}
@@ -623,9 +678,10 @@
 
   function gameHtml() {
     const current = state.players[state.currentPlayer];
-    const statusClass = state.boardGate === 'sync' ? 'sync' : (takingOut || state.turnDarts >= 3 ? 'takeout' : '');
+    const statusClass = state.boardGate === 'sync' ? 'sync' : state.boardGate === 'review' ? 'review' : (takingOut || state.turnDarts >= 3 ? 'takeout' : '');
     const statusText = state.winner !== null ? `${state.players[state.winner].name} gewinnt!`
       : state.boardGate === 'sync' ? 'Aufnahme synchronisieren'
+      : state.boardGate === 'review' ? 'Vorherigen Spieler korrigieren'
       : state.inputMode === 'board' && state.boardGate === 'await-empty' ? 'Board leeren'
       : takingOut || state.turnDarts >= 3 ? 'Darts herausziehen'
       : `${current?.name || 'Spieler'} ist dran`;
@@ -643,8 +699,10 @@
 
     const scoreCells = state.players.map((player, index) => `<td class="${index === state.currentPlayer ? 'active-player' : ''}"><span class="${APP_ID}-score">${player.score}</span></td>`).join('');
     const winner = state.winner !== null ? `<div class="${APP_ID}-winner">🏆 ${escapeHtml(state.players[state.winner].name)} gewinnt!</div>` : '';
-    const visitEditable = state.boardGate === 'ready' && !takingOut && !state.legacyVisit;
+    const visitEditable = ['ready', 'review'].includes(state.boardGate) && !takingOut && !state.legacyVisit;
     const canUndo = visitEditable && state.visit?.throws.some((_, i) => effectiveThrow(i) !== null);
+    const canReset = visitEditable && Boolean(state.visit?.throws?.length);
+    const canPrevious = Boolean(state.previousVisit) && !takingOut && !state.legacyVisit && !state.visit?.throws?.length;
     const choices = ['MISS', ...Array.from({ length: 20 }, (_, i) => i + 1).flatMap((n) => ['S', 'D', 'T'].map((m) => `${m}${n}`)), 'S25', 'D25'];
     const corrections = (state.visit?.throws || []).map((segment, i) => {
       const selected = Object.hasOwn(state.visit.overrides, i) ? (effectiveThrow(i)?.name || 'ignore') : 'board';
@@ -719,6 +777,8 @@
         </section>
       </div>
       <div class="${APP_ID}-actions" style="margin-top:14px">
+        <button class="${APP_ID}-btn" data-action="previous" ${canPrevious ? '' : 'disabled'}>← Vorheriger Spieler</button>
+        <button class="${APP_ID}-btn" data-action="reset-visit" ${canReset ? '' : 'disabled'}>Würfe zurücksetzen</button>
         <button class="${APP_ID}-btn" data-action="undo" ${canUndo ? '' : 'disabled'}>${state.inputMode === 'test' ? '↶ Undo' : 'Letzten Dart streichen'}</button>
         <button class="${APP_ID}-btn" data-action="next" ${state.winner !== null || (state.inputMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
         <button class="${APP_ID}-btn danger" data-action="new-game">Neues Spiel</button>
@@ -828,6 +888,8 @@
           if (host) state.boardHost = host.value.trim() || DEFAULT_BOARD_HOST;
           startGame();
         }
+        if (action === 'previous') previousPlayer();
+        if (action === 'reset-visit') resetVisit();
         if (action === 'undo') undo();
         if (action === 'next') nextPlayer();
         if (action === 'resume') resumeBoard();

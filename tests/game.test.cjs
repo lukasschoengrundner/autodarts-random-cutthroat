@@ -10,7 +10,7 @@ const instrumented = script.replace("  if (document.readyState === 'loading') {"
   globalThis.api = {
     state: () => state, diagnostics: () => ({ connectionStatus, storageWarning, lastEvent }),
     generateTargets, normalizeSegment, beginVisit, processThrow, handleBoardMessage, nextPlayer,
-    undo, correctThrow, boardWsUrl, connectBoard, disconnectBoard, resumeBoard, saveState,
+    undo, correctThrow, previousPlayer, resetVisit, boardWsUrl, connectBoard, disconnectBoard, resumeBoard, saveState,
     setupHtml, gameHtml, startGame, newGame,
   };
   if (document.readyState === 'loading') {`);
@@ -333,4 +333,58 @@ test('identical throws in consecutive visits count for the correct players', () 
   h.send([segment(18, 3), segment(18, 3), segment(18, 3)]);
   assert.equal(h.s.players[1].marks[18], 3); assert.equal(h.s.players[0].score, 0);
   h.send([], 'Manual reset'); assert.equal(h.s.players[1].marks[18], undefined); assert.equal(h.s.players[1].score, 108); assert.equal(h.s.players[0].marks[18], 3);
+});
+
+
+test('previous player reopens the last completed visit for correction', () => {
+  const h = game('test');
+  h.api.processThrow(segment(18));
+  h.api.nextPlayer();
+  assert.equal(h.s.currentPlayer, 1);
+  assert(h.s.previousVisit);
+  h.api.previousPlayer();
+  assert.equal(h.s.currentPlayer, 0);
+  assert.equal(h.s.turnDarts, 1);
+  assert.equal(h.s.players[0].marks[18], 1);
+  h.api.correctThrow(0, 'D18');
+  assert.equal(h.s.players[0].marks[18], 2);
+  h.api.nextPlayer();
+  assert.equal(h.s.currentPlayer, 1);
+  assert.equal(h.s.players[0].marks[18], 2);
+});
+
+test('previous player is not allowed after the current player has thrown', () => {
+  const h = game('test');
+  h.api.processThrow(segment(18));
+  h.api.nextPlayer();
+  h.api.processThrow(segment(20));
+  h.api.previousPlayer();
+  assert.equal(h.s.currentPlayer, 1);
+  assert.match(h.s.notice, /bereits Würfe/);
+});
+
+test('reset visit clears a test visit and allows throwing again', () => {
+  const h = game('test');
+  h.api.processThrow(segment(18, 2));
+  assert.equal(h.s.players[0].marks[18], 2);
+  h.api.resetVisit();
+  assert.equal(h.s.turnDarts, 0);
+  assert.equal(h.s.visit.throws.length, 0);
+  assert.equal(h.s.players[0].marks[18], undefined);
+  h.api.processThrow(segment(20));
+  assert.equal(h.s.players[0].marks[20], 1);
+});
+
+test('reset visit in board mode removes scoring but keeps detected dart slots for correction', () => {
+  const h = game();
+  h.send([segment(18)]);
+  assert.equal(h.s.players[0].marks[18], 1);
+  h.api.resetVisit();
+  assert.equal(h.s.turnDarts, 1);
+  assert.equal(h.s.visit.throws.length, 1);
+  assert.equal(h.s.players[0].marks[18], undefined);
+  h.send([segment(18)]);
+  assert.equal(h.s.players[0].marks[18], undefined);
+  h.send([segment(18, 2)], 'Throw corrected');
+  assert.equal(h.s.players[0].marks[18], 2);
 });

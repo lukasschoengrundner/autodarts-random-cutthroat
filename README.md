@@ -2,7 +2,7 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Random Cutthroat Cricket als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.3.0:** Helles, TV-taugliches Spielinterface mit Dartscheibe und großen offenen Zielzahlen. Die Windows-/Board-Manager-Funktionen aus 0.2.0 bleiben erhalten. Die automatisierten Tests und der lokale Browsertest verwenden simulierte Board-Meldungen. Ein Praxistest mit echten Kameras steht noch aus.
+**Version 0.3.1:** Helles, TV-taugliches Spielinterface mit Dartscheibe und großen offenen Zielzahlen. Die Windows-/Board-Manager-Funktionen aus 0.2.0 bleiben erhalten. Die automatisierten Tests und der lokale Browsertest verwenden simulierte Board-Meldungen. Ein Praxistest mit echten Kameras steht noch aus.
 
 ## Aufbau unter Windows
 
@@ -71,6 +71,8 @@ Unter **Verbindungsdiagnose** stehen Adresse, Verbindungsstatus, letztes Board-E
 
 ## Wertung, Korrekturen und Spielerwechsel
 
+- **Vorheriger Spieler** öffnet die zuletzt abgeschlossene Aufnahme erneut, solange der neue Spieler noch keinen Dart geworfen hat. Danach können Würfe korrigiert oder zurückgesetzt werden.
+- **Würfe zurücksetzen** leert die Aufnahme im Testmodus; im Kameramodus nimmt es die Wertung der erkannten Darts zurück, hält deren Wurfplätze aber für Korrekturen belegt.
 - Das Script gleicht die **gesamte aktuelle Aufnahme** ab. Fehlt eine Zwischenmeldung, können die später darin enthaltenen Würfe nachgetragen werden. Identische Meldungen zählen nicht erneut.
 - Ändert das Board ein Segment, wird die Aufnahme einschließlich Strafpunkten neu berechnet. Änderungen werden aus konsistenten `state`-Meldungen übernommen, statt nur den letzten Dart einer Liste hinzuzuzählen.
 - Über die Auswahl **Dart 1/2/3 korrigieren** kann ein Dart lokal ersetzt, gestrichen oder auf seinen Originalwert zurückgestellt werden. Diese Korrektur verändert nicht den Board Manager oder ein offizielles Match.

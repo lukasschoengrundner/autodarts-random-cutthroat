@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 – 2026-09-10
+
+- „Vorheriger Spieler“: Die zuletzt abgeschlossene Aufnahme kann wieder geöffnet und korrigiert werden.
+- „Würfe zurücksetzen“: Im Testmodus wird die Aufnahme geleert; im Kameramodus wird ihre Wertung zurückgenommen, ohne die physischen Wurfplätze zu verlieren.
+- Korrekturen und Undo funktionieren auch im neuen Review-Modus; Board-Ereignisse werden während der Korrektur nicht ungefragt übernommen.
+
 ## 0.3.0 – 2026-09-10
 
 - Helles, TV-taugliches Spielinterface mit deutlich größeren offenen Zielzahlen.
