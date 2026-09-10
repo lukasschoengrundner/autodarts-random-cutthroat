@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 – 2026-09-10
+
+- Helles, TV-taugliches Spielinterface mit deutlich größeren offenen Zielzahlen.
+- Grafische Dartscheibe mit hervorgehobenen Random-Cricket-Zielen; geschlossene Ziele werden separat markiert.
+- Neue Spieler-Karten, aktuelle Drei-Dart-Anzeige und klarer Status für Spieler am Board, Takeout und Synchronisierung.
+- Die bestehende Spiel- und Board-Manager-Logik bleibt unverändert.
+
 ## 0.2.0 – 2026-09-06
 
 - Standardadresse für Kameras am selben Windows-PC: `http://localhost:3180`; Migration der bisherigen Standardadresse unter Erhalt individueller Adressen.

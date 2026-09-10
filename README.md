@@ -2,7 +2,7 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Random Cutthroat Cricket als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.2.0:** Windows-Voreinstellung, vollständige Aufnahmen, Wurfkorrekturen und ein eigener Testmodus ohne Kameras. Die automatisierten Tests und der lokale Browsertest verwenden simulierte Board-Meldungen. Ein Praxistest mit echten Kameras steht noch aus.
+**Version 0.3.0:** Helles, TV-taugliches Spielinterface mit Dartscheibe und großen offenen Zielzahlen. Die Windows-/Board-Manager-Funktionen aus 0.2.0 bleiben erhalten. Die automatisierten Tests und der lokale Browsertest verwenden simulierte Board-Meldungen. Ein Praxistest mit echten Kameras steht noch aus.
 
 ## Aufbau unter Windows
 
