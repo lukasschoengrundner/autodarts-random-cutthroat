@@ -9,9 +9,12 @@ const script = readFileSync(path.join(__dirname, '..', 'autodarts-random-cutthro
 const instrumented = script.replace("  if (document.readyState === 'loading') {", `
   globalThis.api = {
     state: () => state, diagnostics: () => ({ connectionStatus, storageWarning, lastEvent }),
+    network: () => network, remoteProfile: () => remoteProfile,
     generateTargets, normalizeSegment, beginVisit, processThrow, handleBoardMessage, nextPlayer,
     undo, correctThrow, previousPlayer, resetVisit, boardWsUrl, connectBoard, disconnectBoard, resumeBoard, saveState,
-    setupHtml, gameHtml, startGame, newGame,
+    setupHtml, gameHtml, startGame, newGame, normalizeRoomCode, sharedStateSnapshot, validSharedState,
+    applySharedStateSnapshot, handleHostData, handleGuestData, dispatchGameAction, useLocalMode, prepareGuestMode,
+    actorInputMode, actorBoard,
   };
   if (document.readyState === 'loading') {`);
 assert.notEqual(instrumented, script);
@@ -21,7 +24,8 @@ function harness(saved, options = {}) {
   const timers = new Map();
   const errors = [];
   let timerId = 0;
-  let storage = saved ? JSON.stringify(saved) : null;
+  const storage = new Map();
+  if (saved) storage.set('autodarts-random-cutthroat:v1', JSON.stringify(saved));
   class Socket {
     static OPEN = 1;
     static CONNECTING = 0;
@@ -40,8 +44,8 @@ function harness(saved, options = {}) {
   const context = vm.createContext({
     URL, console: { warn: (...values) => errors.push(values) }, WebSocket: Socket,
     localStorage: {
-      getItem: () => storage,
-      setItem: (_, value) => { if (options.storageThrows) throw new Error('Quota exceeded'); storage = value; },
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => { if (options.storageThrows) throw new Error('Quota exceeded'); storage.set(key, value); },
     },
     document: { readyState: 'loading', addEventListener: () => {}, querySelectorAll: () => [{ value: 'Alice' }, { value: 'Bob' }] },
     requestAnimationFrame: () => {},
@@ -51,7 +55,7 @@ function harness(saved, options = {}) {
   vm.runInContext(instrumented, context);
   const api = context.api;
   return { api, s: api.state(), sockets, errors,
-    saved: () => JSON.parse(storage),
+    saved: () => JSON.parse(storage.get('autodarts-random-cutthroat:v1')),
     retry: () => { const callbacks = [...timers.values()]; timers.clear(); callbacks.forEach((fn) => fn()); },
     send: (throws = [], event = 'Throw detected', extras = {}) => api.handleBoardMessage(packet(throws, event, extras)),
   };
@@ -318,6 +322,110 @@ test('blocked websocket constructor reports failure without throwing into the pa
 test('player names and diagnostics cannot inject markup into the overlay', () => {
   const h = game('test'); h.s.players[0].name = '<img src=x onerror=alert(1)>'; h.s.boardHost = '" onfocus="x';
   assert.doesNotMatch(h.api.gameHtml(), /<img/); assert.match(h.api.setupHtml(), /&quot;/);
+});
+
+test('online room codes are normalized and ambiguous characters are rejected', () => {
+  const { api } = harness();
+  assert.equal(api.normalizeRoomCode(' ab-cd 29!'), 'ABCD29');
+  assert.equal(api.normalizeRoomCode('äöü'), '');
+  assert.equal(api.normalizeRoomCode('123456789'), '234567');
+});
+
+test('shared online state excludes local board settings and preserves them on the guest', () => {
+  const host = game('test');
+  host.api.network().role = 'host';
+  host.s.players[0].marks[18] = 2;
+  const snapshot = host.api.sharedStateSnapshot();
+  assert.equal(snapshot.inputMode, undefined);
+  assert.equal(snapshot.boardHost, undefined);
+  assert.equal(snapshot.connected, undefined);
+
+  const guest = harness();
+  guest.api.network().role = 'guest';
+  guest.s.inputMode = 'board'; guest.s.boardHost = 'http://192.168.1.50:3180'; guest.s.connected = true;
+  assert.equal(guest.api.applySharedStateSnapshot(snapshot), true);
+  assert.equal(guest.s.players[0].marks[18], 2);
+  assert.equal(guest.s.inputMode, 'board');
+  assert.equal(guest.s.boardHost, 'http://192.168.1.50:3180');
+  assert.equal(guest.s.connected, true);
+  assert.equal(guest.api.actorInputMode(0), 'test');
+  assert.equal(guest.api.actorInputMode(1), 'board');
+  assert.equal(guest.api.actorBoard(0), null);
+});
+
+test('malformed online state is rejected without changing the local game', () => {
+  const h = game('test');
+  const before = scores(h);
+  const malformed = h.api.sharedStateSnapshot();
+  malformed.players[0].marks[18] = 99;
+  assert.equal(h.api.validSharedState(malformed), false);
+  assert.equal(h.api.applySharedStateSnapshot(malformed), false);
+  assert.equal(scores(h), before);
+});
+
+test('host accepts remote board snapshots only while the guest is the active player', () => {
+  const h = game();
+  h.api.network().role = 'host';
+  h.api.handleHostData({
+    type: 'hello', protocol: 1, clientId: 'guestclient123', name: 'Remote', inputMode: 'board', boardConnected: true,
+  });
+  const remotePacket = packet([segment(18)]);
+  h.api.handleHostData({ type: 'board', protocol: 1, clientId: 'guestclient123', raw: remotePacket });
+  assert.equal(h.s.players[1].marks[18], undefined);
+
+  h.s.currentPlayer = 1; h.api.beginVisit(); h.s.boardGate = 'ready';
+  h.api.handleHostData({ type: 'board', protocol: 1, clientId: 'guestclient123', raw: remotePacket });
+  assert.equal(h.s.players[1].marks[18], 1);
+  assert.equal(h.s.players[0].marks[18], undefined);
+});
+
+test('host validates guest identity and applies remote test throws authoritatively', () => {
+  const h = game('test');
+  h.api.network().role = 'host';
+  h.api.handleHostData({
+    type: 'hello', protocol: 1, clientId: 'guestclient123', name: 'Remote', inputMode: 'test', boardConnected: false,
+  });
+  h.api.handleHostData({
+    type: 'profile', protocol: 1, clientId: 'guestclient123', name: 'Changed', inputMode: 'board', boardConnected: true,
+  });
+  assert.equal(h.api.remoteProfile().inputMode, 'test');
+  h.s.currentPlayer = 1; h.api.beginVisit(); h.s.boardGate = 'ready';
+  const action = { type: 'action', action: 'test-throw', protocol: 1, clientId: 'guestclient123', segment: segment(20, 3) };
+  h.api.handleHostData({ ...action, clientId: 'wrongclient999' });
+  assert.equal(h.s.players[1].marks[20], undefined);
+  h.api.handleHostData(action);
+  assert.equal(h.s.players[1].marks[20], 3);
+  h.api.handleHostData({
+    type: 'hello', protocol: 1, clientId: 'differentclient9', name: 'Intruder', inputMode: 'board', boardConnected: true,
+  });
+  assert.equal(h.api.remoteProfile().clientId, 'guestclient123');
+});
+
+test('host can resume the guest board from its authoritative controls', () => {
+  const h = game();
+  h.api.network().role = 'host';
+  h.api.handleHostData({
+    type: 'hello', protocol: 1, clientId: 'guestclient123', name: 'Remote', inputMode: 'board', boardConnected: true,
+  });
+  h.s.currentPlayer = 1; h.api.beginVisit(); h.s.boardGate = 'sync';
+  h.api.handleHostData({ type: 'board', protocol: 1, clientId: 'guestclient123', raw: packet([segment(20)]) });
+  h.api.dispatchGameAction('resume');
+  assert.equal(h.s.boardGate, 'ready');
+  assert.equal(h.s.players[1].marks[20], 1);
+});
+
+test('guest ignores duplicate and older authoritative state revisions', () => {
+  const host = game('test');
+  const guest = harness();
+  guest.api.network().role = 'guest';
+  const first = host.api.sharedStateSnapshot();
+  first.players[0].score = 10;
+  guest.api.handleGuestData({ type: 'state', protocol: 1, sessionId: 'session-a', revision: 2, state: first });
+  assert.equal(guest.s.players[0].score, 10);
+  const stale = host.api.sharedStateSnapshot();
+  stale.players[0].score = 99;
+  guest.api.handleGuestData({ type: 'state', protocol: 1, sessionId: 'session-a', revision: 1, state: stale });
+  assert.equal(guest.s.players[0].score, 10);
 });
 test('an empty Started snapshot can arm a newly started game', () => {
   const h = game(); h.s.boardGate = 'await-empty'; h.send([], 'Started');

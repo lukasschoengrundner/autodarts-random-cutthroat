@@ -1,13 +1,14 @@
 // ==UserScript==
-// @name         Autodarts Random Cutthroat Cricket
+// @name         Autodarts – Cricket Random Cutthroat
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.3.1
-// @description  Random Cutthroat Cricket overlay for Autodarts. 7 random targets, Bull always/never/random, local Board Manager scoring.
+// @version      0.4.0
+// @description  Cricket Random Cutthroat overlay for Autodarts. Local games or encrypted online rooms with a friend.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
 // @match        https://play.autodarts.io/*
 // @updateURL    https://raw.githubusercontent.com/lukasschoengrundner/autodarts-random-cutthroat/main/autodarts-random-cutthroat.user.js
 // @downloadURL  https://raw.githubusercontent.com/lukasschoengrundner/autodarts-random-cutthroat/main/autodarts-random-cutthroat.user.js
+// @require      https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js
 // @grant        none
 // ==/UserScript==
 
@@ -16,8 +17,16 @@
 
   const APP_ID = 'ad-rcc';
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
+  const NETWORK_STORAGE_KEY = 'autodarts-random-cutthroat:network:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.3.1';
+  const VERSION = '0.4.0';
+  const ONLINE_PROTOCOL = 1;
+  const ROOM_PREFIX = 'ad-rcc-';
+  const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const SHARED_STATE_KEYS = [
+    'schemaVersion', 'screen', 'bullMode', 'targetCount', 'targets', 'players', 'currentPlayer',
+    'turnDarts', 'turnSerial', 'winner', 'boardGate', 'visit', 'previousVisit', 'legacyVisit', 'notice',
+  ];
   const MARKS = ['–', '/', 'X', '⊗'];
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const defaultState = () => ({
@@ -38,6 +47,133 @@
   let lastEvent = 'Noch keine Board-Meldung';
   let storageWarning = '';
   let resetHandled = false;
+  let lastRawBoardMessage = null;
+
+  let network = loadNetwork();
+  let peer = null;
+  let peerConnection = null;
+  let peerGeneration = 0;
+  let networkRetryTimer = null;
+  let networkStatus = network.role === 'local' ? 'Lokales Spiel' : 'Online-Verbindung wird vorbereitet';
+  let networkRevision = 0;
+  let remoteBoard = null;
+  let remoteHostInputMode = 'board';
+  let remoteProfile = {
+    clientId: '', name: 'Freund', inputMode: 'board', boardConnected: false,
+    lastEvent: 'Noch keine Board-Meldung',
+  };
+
+  function randomToken(length, alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789') {
+    const bytes = new Uint8Array(length);
+    if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+    else for (let i = 0; i < length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+    return [...bytes].map((value) => alphabet[value % alphabet.length]).join('');
+  }
+
+  function normalizeRoomCode(value) {
+    return String(value || '').toUpperCase().replace(/[^A-Z2-9]/g, '').slice(0, 6);
+  }
+
+  function randomRoomCode() { return randomToken(6, ROOM_ALPHABET); }
+  function roomPeerId(code) { return `${ROOM_PREFIX}${normalizeRoomCode(code).toLowerCase()}`; }
+  function sanitizeName(value, fallback = 'Spieler') {
+    const name = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40);
+    return name || fallback;
+  }
+
+  function loadNetwork() {
+    const base = {
+      role: 'local', roomCode: '', clientId: randomToken(16), connected: false,
+      hostSession: '', appliedSession: '', appliedRevision: -1,
+    };
+    try {
+      const saved = JSON.parse(localStorage.getItem(NETWORK_STORAGE_KEY) || 'null');
+      if (!saved || !['local', 'host', 'guest'].includes(saved.role)) return base;
+      return {
+        ...base,
+        role: saved.role,
+        roomCode: normalizeRoomCode(saved.roomCode),
+        clientId: /^[a-z0-9]{8,32}$/i.test(saved.clientId || '') ? saved.clientId : base.clientId,
+      };
+    } catch (_) {
+      return base;
+    }
+  }
+
+  function saveNetwork() {
+    try {
+      localStorage.setItem(NETWORK_STORAGE_KEY, JSON.stringify({
+        role: network.role, roomCode: network.roomCode, clientId: network.clientId,
+      }));
+    } catch (_) { /* The game itself still works without saved reconnect preferences. */ }
+  }
+
+  function sharedStateSnapshot() {
+    return {
+      ...Object.fromEntries(SHARED_STATE_KEYS.map((key) => [key, clone(state[key])])),
+      hostInputMode: state.inputMode,
+      takingOut: Boolean(takingOut),
+    };
+  }
+
+  function validSharedState(value) {
+    if (!value || typeof value !== 'object' || !validPlayers(value.players)) return false;
+    if (!['setup', 'game'].includes(value.screen) || !['always', 'never', 'random'].includes(value.bullMode)) return false;
+    if (!Number.isInteger(value.currentPlayer) || value.currentPlayer < 0 || value.currentPlayer >= value.players.length) return false;
+    if (!Number.isInteger(value.turnDarts) || value.turnDarts < 0 || value.turnDarts > 3) return false;
+    if (!Number.isInteger(value.turnSerial) || value.turnSerial < 0) return false;
+    if (value.winner !== null && (!Number.isInteger(value.winner) || value.winner < 0 || value.winner >= value.players.length)) return false;
+    if (!['await-empty', 'ready', 'sync', 'review', 'finished'].includes(value.boardGate)
+      || !['board', 'test'].includes(value.hostInputMode) || typeof value.takingOut !== 'boolean') return false;
+    if (value.screen === 'setup') return Array.isArray(value.targets);
+    if (!Array.isArray(value.targets) || value.targets.length !== 7 || new Set(value.targets).size !== 7
+      || !value.targets.every((target) => Number.isInteger(target) && ((target >= 1 && target <= 20) || target === 25))) return false;
+    if (!value.legacyVisit && !validVisit(value.visit, value.players.length, value.currentPlayer)) return false;
+    return value.previousVisit === null || validTurnSnapshot(value.previousVisit, value.players.length);
+  }
+
+  function applySharedStateSnapshot(snapshot) {
+    if (!validSharedState(snapshot)) return false;
+    const local = {
+      boardHost: state.boardHost, inputMode: state.inputMode, connected: state.connected,
+      minimized: state.minimized,
+    };
+    const shared = clone(snapshot);
+    remoteHostInputMode = shared.hostInputMode;
+    delete shared.hostInputMode;
+    takingOut = shared.takingOut;
+    delete shared.takingOut;
+    Object.assign(state, shared, local);
+    saveState();
+    render();
+    return true;
+  }
+
+  function localPlayerIndex() {
+    if (network.role === 'host') return 0;
+    if (network.role === 'guest') return 1;
+    return state.currentPlayer;
+  }
+
+  function isLocalTurn() {
+    return network.role === 'local' || state.currentPlayer === localPlayerIndex();
+  }
+
+  function actorInputMode(actorIndex = state.currentPlayer) {
+    if (network.role === 'host' && actorIndex === 1) return remoteProfile.inputMode;
+    if (network.role === 'guest' && actorIndex === 0) return remoteHostInputMode;
+    return state.inputMode;
+  }
+
+  function actorBoard(actorIndex = state.currentPlayer) {
+    if (network.role === 'guest' && actorIndex === 0) return null;
+    return network.role === 'host' && actorIndex === 1 ? remoteBoard : lastBoard;
+  }
+
+  function actorBoardConnected(actorIndex = state.currentPlayer) {
+    if (network.role === 'guest' && actorIndex === 0) return false;
+    return network.role === 'host' && actorIndex === 1 ? remoteProfile.boardConnected : state.connected;
+  }
 
   function validPlayers(players) {
     return Array.isArray(players) && players.length >= 2 && players.length <= 8
@@ -85,7 +221,7 @@
       delete loaded.lastProcessedFingerprint;
       return loaded;
     } catch (error) {
-      console.warn('[Random Cutthroat] Could not load state', error);
+      console.warn('[Cricket Random Cutthroat] Could not load state', error);
       base.notice = 'Gespeicherter Spielstand konnte nicht geladen werden.';
       return base;
     }
@@ -112,11 +248,451 @@
       storageWarning = '';
     } catch (error) {
       storageWarning = 'Spielstand kann nicht gespeichert werden. Dieses Browserfenster geöffnet lassen.';
-      console.warn('[Random Cutthroat] Could not save state', error);
+      console.warn('[Cricket Random Cutthroat] Could not save state', error);
     }
   }
 
-  function update() { saveState(); render(); }
+  function update(options = {}) {
+    saveState();
+    render();
+    if (network.role === 'host' && options.broadcast !== false) broadcastState();
+  }
+
+  function sendConnection(connection, message) {
+    if (!connection?.open) return false;
+    try {
+      connection.send(message);
+      return true;
+    } catch (error) {
+      console.warn('[Cricket Random Cutthroat] Online message failed', error);
+      return false;
+    }
+  }
+
+  function broadcastState() {
+    if (network.role !== 'host' || !network.connected || !peerConnection?.open) return;
+    sendConnection(peerConnection, {
+      type: 'state', protocol: ONLINE_PROTOCOL, version: VERSION,
+      sessionId: network.hostSession, revision: ++networkRevision,
+      state: sharedStateSnapshot(),
+    });
+  }
+
+  function sendGuestMessage(message) {
+    if (network.role !== 'guest') return false;
+    return sendConnection(peerConnection, { ...message, protocol: ONLINE_PROTOCOL, clientId: network.clientId });
+  }
+
+  function destroyPeerRuntime() {
+    peerGeneration += 1;
+    clearTimeout(networkRetryTimer);
+    networkRetryTimer = null;
+    const connection = peerConnection;
+    const activePeer = peer;
+    peerConnection = null;
+    peer = null;
+    network.connected = false;
+    if (connection) { try { connection.close(); } catch (_) { /* already closed */ } }
+    if (activePeer) { try { activePeer.destroy(); } catch (_) { /* already destroyed */ } }
+    remoteBoard = null;
+    remoteProfile = {
+      clientId: '', name: state.players[1]?.name || 'Freund', inputMode: 'board', boardConnected: false,
+      lastEvent: 'Noch keine Board-Meldung',
+    };
+  }
+
+  function useLocalMode() {
+    destroyPeerRuntime();
+    network.role = 'local';
+    network.roomCode = '';
+    network.hostSession = '';
+    network.appliedSession = '';
+    network.appliedRevision = -1;
+    networkStatus = 'Lokales Spiel';
+    saveNetwork();
+    render();
+  }
+
+  function prepareGuestMode() {
+    destroyPeerRuntime();
+    network.role = 'guest';
+    network.roomCode = '';
+    network.appliedSession = '';
+    network.appliedRevision = -1;
+    networkStatus = 'Raumcode des Hosts eingeben.';
+    while (state.players.length < 2) state.players.push({ name: `Spieler ${state.players.length + 1}`, marks: {}, score: 0 });
+    saveNetwork();
+    render();
+  }
+
+  async function copyRoomCode() {
+    if (!network.roomCode) return;
+    try {
+      await navigator.clipboard.writeText(network.roomCode);
+      networkStatus = `Raumcode ${network.roomCode} kopiert`;
+    } catch (_) {
+      networkStatus = `Raumcode: ${network.roomCode}`;
+    }
+    render();
+  }
+
+  function peerConstructor() {
+    return typeof globalThis.Peer === 'function' ? globalThis.Peer : null;
+  }
+
+  function schedulePeerReconnect(callback, generation) {
+    clearTimeout(networkRetryTimer);
+    networkRetryTimer = setTimeout(() => {
+      if (generation === peerGeneration) callback();
+    }, 3000);
+  }
+
+  function createOnlineRoom(code = randomRoomCode()) {
+    const PeerClient = peerConstructor();
+    if (!PeerClient) {
+      networkStatus = 'Online-Bibliothek konnte nicht geladen werden. Seite neu laden und Tampermonkey prüfen.';
+      render();
+      return;
+    }
+    destroyPeerRuntime();
+    network.role = 'host';
+    network.roomCode = normalizeRoomCode(code) || randomRoomCode();
+    network.hostSession = randomToken(12);
+    network.appliedSession = '';
+    network.appliedRevision = -1;
+    networkRevision = 0;
+    networkStatus = `Raum ${network.roomCode} wird erstellt …`;
+    saveNetwork();
+    const generation = peerGeneration;
+    let activePeer;
+    try {
+      activePeer = new PeerClient(roomPeerId(network.roomCode), { debug: 1 });
+      peer = activePeer;
+    } catch (error) {
+      networkStatus = `Online-Raum konnte nicht erstellt werden: ${error.message}`;
+      render();
+      return;
+    }
+    activePeer.on('open', () => {
+      if (peer !== activePeer || generation !== peerGeneration) return;
+      networkStatus = `Raum ${network.roomCode} ist offen – auf Freund warten`;
+      render();
+    });
+    activePeer.on('connection', (connection) => {
+      if (peer !== activePeer || generation !== peerGeneration) { connection.close(); return; }
+      bindHostConnection(connection, generation);
+    });
+    activePeer.on('disconnected', () => {
+      if (peer !== activePeer || generation !== peerGeneration) return;
+      networkStatus = 'Verbindung zum Vermittlungsdienst unterbrochen – neuer Versuch …';
+      render();
+      schedulePeerReconnect(() => { try { activePeer.reconnect(); } catch (_) { /* retry via status button */ } }, generation);
+    });
+    activePeer.on('error', (error) => {
+      if (peer !== activePeer || generation !== peerGeneration) return;
+      networkStatus = error?.type === 'unavailable-id'
+        ? 'Dieser Raumcode ist bereits belegt. Bitte einen neuen Raum erstellen.'
+        : `Online-Fehler: ${error?.message || error?.type || 'unbekannt'}`;
+      render();
+    });
+    render();
+  }
+
+  function bindHostConnection(connection, generation) {
+    // Reserve the only guest slot immediately. Two simultaneous connection
+    // attempts must not be able to replace each other before either is open.
+    if (peerConnection) {
+      connection.on('open', () => {
+        sendConnection(connection, { type: 'error', protocol: ONLINE_PROTOCOL, message: 'Raum ist bereits voll.' });
+        connection.close();
+      });
+      return;
+    }
+    peerConnection = connection;
+    connection.on('open', () => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      networkStatus = 'Freund verbunden – Anmeldung wird geprüft …';
+      render();
+    });
+    connection.on('data', (message) => {
+      if (peerConnection === connection && generation === peerGeneration) handleHostData(message);
+    });
+    connection.on('close', () => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      peerConnection = null;
+      network.connected = false;
+      remoteProfile.boardConnected = false;
+      remoteBoard = null;
+      networkStatus = `Freund getrennt – Raum ${network.roomCode} bleibt offen`;
+      blockForSync('Online-Verbindung zum aktuellen Spieler unterbrochen. Auf die Wiederverbindung warten.', 1);
+      update({ broadcast: false });
+    });
+    connection.on('error', (error) => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      peerConnection = null;
+      network.connected = false;
+      remoteProfile.boardConnected = false;
+      remoteBoard = null;
+      networkStatus = `Verbindungsfehler zum Freund: ${error?.message || 'unbekannt'}`;
+      blockForSync('Online-Verbindung zum aktuellen Spieler unterbrochen. Auf die Wiederverbindung warten.', 1);
+      try { connection.close(); } catch (_) { /* already closed */ }
+      update({ broadcast: false });
+    });
+  }
+
+  function joinOnlineRoom(code) {
+    const roomCode = normalizeRoomCode(code);
+    if (roomCode.length !== 6) {
+      networkStatus = 'Bitte den sechsstelligen Raumcode eingeben.';
+      render();
+      return;
+    }
+    const PeerClient = peerConstructor();
+    if (!PeerClient) {
+      networkStatus = 'Online-Bibliothek konnte nicht geladen werden. Seite neu laden und Tampermonkey prüfen.';
+      render();
+      return;
+    }
+    destroyPeerRuntime();
+    network.role = 'guest';
+    network.roomCode = roomCode;
+    network.appliedSession = '';
+    network.appliedRevision = -1;
+    networkStatus = `Raum ${roomCode} wird gesucht …`;
+    saveNetwork();
+    const generation = peerGeneration;
+    let activePeer;
+    try {
+      activePeer = new PeerClient(undefined, { debug: 1 });
+      peer = activePeer;
+    } catch (error) {
+      networkStatus = `Online-Verbindung konnte nicht gestartet werden: ${error.message}`;
+      render();
+      return;
+    }
+    activePeer.on('open', () => {
+      if (peer === activePeer && generation === peerGeneration) connectGuestToHost(generation);
+    });
+    activePeer.on('disconnected', () => {
+      if (peer !== activePeer || generation !== peerGeneration) return;
+      networkStatus = 'Vermittlungsdienst getrennt – Verbindung wird wiederhergestellt …';
+      network.connected = false;
+      render();
+      schedulePeerReconnect(() => { try { activePeer.reconnect(); } catch (_) { connectGuestToHost(generation); } }, generation);
+    });
+    activePeer.on('error', (error) => {
+      if (peer !== activePeer || generation !== peerGeneration) return;
+      if (error?.type === 'peer-unavailable') {
+        const pending = peerConnection;
+        peerConnection = null;
+        network.connected = false;
+        if (pending) { try { pending.close(); } catch (_) { /* already closed */ } }
+        networkStatus = `Raum ${network.roomCode} wurde noch nicht gefunden – neuer Versuch …`;
+        schedulePeerReconnect(() => connectGuestToHost(generation), generation);
+      } else {
+        networkStatus = `Online-Fehler: ${error?.message || error?.type || 'unbekannt'}`;
+      }
+      render();
+    });
+    render();
+  }
+
+  function connectGuestToHost(generation = peerGeneration) {
+    if (network.role !== 'guest' || !peer || generation !== peerGeneration) return;
+    if (peerConnection) return;
+    let connection;
+    try {
+      connection = peer.connect(roomPeerId(network.roomCode), { reliable: true, serialization: 'json' });
+      peerConnection = connection;
+    } catch (error) {
+      networkStatus = `Beitritt fehlgeschlagen: ${error.message}`;
+      render();
+      return;
+    }
+    connection.on('open', () => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      network.connected = true;
+      networkStatus = `Mit Raum ${network.roomCode} verbunden`;
+      sendGuestProfile('hello');
+      render();
+    });
+    connection.on('data', (message) => {
+      if (peerConnection === connection && generation === peerGeneration) handleGuestData(message);
+    });
+    connection.on('close', () => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      peerConnection = null;
+      network.connected = false;
+      networkStatus = `Verbindung zu Raum ${network.roomCode} getrennt – neuer Versuch …`;
+      render();
+      schedulePeerReconnect(() => connectGuestToHost(generation), generation);
+    });
+    connection.on('error', (error) => {
+      if (peerConnection !== connection || generation !== peerGeneration) return;
+      peerConnection = null;
+      network.connected = false;
+      networkStatus = `Verbindungsfehler: ${error?.message || 'unbekannt'} – neuer Versuch …`;
+      try { connection.close(); } catch (_) { /* already closed */ }
+      render();
+      schedulePeerReconnect(() => connectGuestToHost(generation), generation);
+    });
+  }
+
+  function localOnlineName() {
+    const index = network.role === 'guest' ? 1 : 0;
+    return sanitizeName(state.players[index]?.name, network.role === 'guest' ? 'Freund' : 'Host');
+  }
+
+  function sendGuestProfile(type = 'profile') {
+    sendGuestMessage({
+      type, name: localOnlineName(), inputMode: state.inputMode,
+      boardConnected: Boolean(state.connected), version: VERSION,
+    });
+  }
+
+  function rejectGuest(message) {
+    const rejected = peerConnection;
+    sendConnection(rejected, { type: 'error', protocol: ONLINE_PROTOCOL, message });
+    peerConnection = null;
+    network.connected = false;
+    remoteProfile.boardConnected = false;
+    networkStatus = `${message} Raum ${network.roomCode} bleibt offen.`;
+    if (rejected) { try { rejected.close(); } catch (_) { /* already closed */ } }
+    render();
+  }
+
+  function handleHostData(message) {
+    if (!message || typeof message !== 'object' || message.protocol !== ONLINE_PROTOCOL) return;
+    if (message.type === 'hello') {
+      const clientId = String(message.clientId || '');
+      if (!/^[a-z0-9]{8,32}$/i.test(clientId)) {
+        rejectGuest('Ungültige Online-Anmeldung.');
+        return;
+      }
+      if (state.screen === 'game' && remoteProfile.clientId && remoteProfile.clientId !== clientId) {
+        rejectGuest('Dieses laufende Spiel gehört bereits einem anderen Mitspieler.');
+        return;
+      }
+      const knownRunningGuest = state.screen === 'game' && remoteProfile.clientId === clientId;
+      remoteProfile.clientId = clientId;
+      remoteProfile.boardConnected = Boolean(message.boardConnected);
+      while (state.players.length < 2) state.players.push({ name: 'Freund', marks: {}, score: 0 });
+      if (state.screen === 'setup') {
+        remoteProfile.name = sanitizeName(message.name, 'Freund');
+        remoteProfile.inputMode = message.inputMode === 'test' ? 'test' : 'board';
+        state.players = state.players.slice(0, 2);
+        state.players[1].name = remoteProfile.name;
+      } else {
+        if (!knownRunningGuest) remoteProfile.inputMode = message.inputMode === 'test' ? 'test' : 'board';
+        remoteProfile.name = state.players[1].name;
+      }
+      network.connected = true;
+      networkStatus = `${remoteProfile.name} ist verbunden`;
+      sendConnection(peerConnection, {
+        type: 'welcome', protocol: ONLINE_PROTOCOL, version: VERSION,
+        sessionId: network.hostSession, roomCode: network.roomCode,
+      });
+      update();
+      return;
+    }
+    if (!network.connected || message.clientId !== remoteProfile.clientId) return;
+    if (message.type === 'profile') {
+      remoteProfile.boardConnected = Boolean(message.boardConnected);
+      if (state.screen === 'setup') {
+        remoteProfile.name = sanitizeName(message.name, remoteProfile.name);
+        remoteProfile.inputMode = message.inputMode === 'test' ? 'test' : 'board';
+        if (state.players[1]) state.players[1].name = remoteProfile.name;
+      }
+      update();
+      return;
+    }
+    if (message.type === 'board-status') {
+      remoteProfile.boardConnected = Boolean(message.connected);
+      if (!remoteProfile.boardConnected) {
+        remoteBoard = null;
+        blockForSync('Board-Verbindung des Freundes wurde unterbrochen. Nach dem Verbinden die Aufnahme prüfen.', 1);
+      }
+      update();
+      return;
+    }
+    if (message.type === 'board' && typeof message.raw === 'string' && message.raw.length <= 200000) {
+      if (state.currentPlayer === 1 && remoteProfile.inputMode === 'board') handleBoardMessage(message.raw, 1);
+      return;
+    }
+    if (message.type === 'action') handleRemoteAction(message);
+    if (message.type === 'request-state') broadcastState();
+  }
+
+  function handleGuestData(message) {
+    if (!message || typeof message !== 'object' || message.protocol !== ONLINE_PROTOCOL) return;
+    if (message.type === 'error') {
+      networkStatus = sanitizeName(message.message, 'Online-Verbindung abgelehnt.');
+      render();
+      return;
+    }
+    if (message.type === 'welcome') {
+      network.connected = true;
+      networkStatus = `Mit Raum ${network.roomCode} verbunden`;
+      if (message.sessionId !== network.appliedSession) {
+        network.appliedSession = String(message.sessionId || '');
+        network.appliedRevision = -1;
+      }
+      sendGuestMessage({ type: 'request-state' });
+      render();
+      return;
+    }
+    if (message.type !== 'state' || typeof message.sessionId !== 'string' || !Number.isInteger(message.revision)) return;
+    if (message.sessionId !== network.appliedSession) {
+      network.appliedSession = message.sessionId;
+      network.appliedRevision = -1;
+    }
+    if (message.revision <= network.appliedRevision || !applySharedStateSnapshot(message.state)) return;
+    network.appliedRevision = message.revision;
+    network.connected = true;
+    networkStatus = `Mit Raum ${network.roomCode} verbunden`;
+    if (isLocalTurn() && state.inputMode === 'board' && lastRawBoardMessage) {
+      sendGuestMessage({ type: 'board', raw: lastRawBoardMessage });
+    }
+    if (isLocalTurn() && state.inputMode === 'test' && state.boardGate === 'await-empty') {
+      sendGuestMessage({ type: 'action', action: 'ready' });
+    }
+  }
+
+  function handleRemoteAction(message) {
+    if (network.role !== 'host' || state.screen !== 'game' || state.currentPlayer !== 1) return;
+    const action = String(message.action || '');
+    if (action === 'test-throw' && remoteProfile.inputMode === 'test') {
+      processThrow(message.segment, 'test', 1);
+      return;
+    }
+    if (action === 'ready' && remoteProfile.inputMode === 'test' && state.boardGate === 'await-empty') {
+      state.boardGate = 'ready';
+      state.notice = '';
+      update();
+      return;
+    }
+    if (action === 'next') nextPlayer();
+    if (action === 'previous') previousPlayer();
+    if (action === 'reset-visit') resetVisit();
+    if (action === 'undo') undo();
+    if (action === 'resume') resumeBoard(1);
+    if (action === 'correct') correctThrow(Number(message.index), String(message.value || ''));
+  }
+
+  function dispatchGameAction(action, payload = {}) {
+    if (network.role === 'guest') {
+      if (!network.connected || state.currentPlayer !== 1) return;
+      sendGuestMessage({ type: 'action', action, ...payload });
+      return;
+    }
+    if (action === 'next') nextPlayer();
+    if (action === 'previous') previousPlayer();
+    if (action === 'reset-visit') resetVisit();
+    if (action === 'undo') undo();
+    if (action === 'resume') resumeBoard(network.role === 'host' ? state.currentPlayer : localPlayerIndex());
+    if (action === 'correct') correctThrow(Number(payload.index), String(payload.value || ''));
+    if (action === 'test-throw') processThrow(payload.segment, 'test', localPlayerIndex());
+  }
   function shuffle(values) {
     const result = [...values];
     for (let i = result.length - 1; i > 0; i -= 1) {
@@ -202,8 +778,9 @@
     state.visit.throws = clone(throws);
     replayVisit();
   }
-  function processThrow(segment, source = 'test') {
-    if (source !== 'test' || state.inputMode !== 'test' || state.screen !== 'game' || state.legacyVisit || state.winner !== null || state.turnDarts >= 3) return;
+  function processThrow(segment, source = 'test', actorIndex = localPlayerIndex()) {
+    if (source !== 'test' || actorInputMode(actorIndex) !== 'test' || actorIndex !== state.currentPlayer
+      || state.screen !== 'game' || state.legacyVisit || state.winner !== null || state.turnDarts >= 3) return;
     const normalized = normalizeSegment(segment);
     if (!normalized) return;
     if (!state.visit) beginVisit();
@@ -220,14 +797,18 @@
   function nextPlayer() {
     if (state.screen !== 'game' || state.winner !== null) return;
     // A manual change waits for the physical takeout; repeated clicks cannot skip players.
-    if (state.inputMode === 'board' && state.boardGate === 'await-empty') return;
+    if (actorInputMode(state.currentPlayer) === 'board' && state.boardGate === 'await-empty') return;
     if (state.visit && !state.legacyVisit) state.previousVisit = snapshotCurrentTurn();
     state.currentPlayer = (state.currentPlayer + 1) % state.players.length;
     state.turnSerial += 1;
+    resetHandled = false;
     beginVisit();
-    state.boardGate = state.inputMode === 'board' ? 'await-empty' : 'ready';
+    state.boardGate = actorInputMode(state.currentPlayer) === 'board' ? 'await-empty' : 'ready';
     state.notice = '';
     update();
+    if (network.role === 'host' && state.currentPlayer === 0 && state.inputMode === 'board' && lastRawBoardMessage) {
+      handleBoardMessage(lastRawBoardMessage, 0);
+    }
   }
   function previousPlayer() {
     if (state.screen !== 'game' || !validTurnSnapshot(state.previousVisit, state.players.length) || takingOut) return;
@@ -246,13 +827,13 @@
     state.previousVisit = null;
     state.legacyVisit = false;
     takingOut = false;
-    state.boardGate = state.inputMode === 'board' ? 'review' : 'ready';
+    state.boardGate = actorInputMode(state.currentPlayer) === 'board' ? 'review' : 'ready';
     state.notice = 'Vorherige Aufnahme geöffnet. Würfe korrigieren oder zurücksetzen und danach mit „Nächster Spieler“ fortfahren.';
     update();
   }
   function resetVisit() {
     if (state.screen !== 'game' || !state.visit || state.legacyVisit || takingOut || !['ready', 'review'].includes(state.boardGate)) return;
-    if (state.inputMode === 'test') {
+    if (actorInputMode(state.currentPlayer) === 'test') {
       state.visit.throws = [];
       state.visit.overrides = {};
       replayVisit();
@@ -266,7 +847,7 @@
   }
   function undo() {
     if (state.screen !== 'game' || !state.visit || state.legacyVisit || state.boardGate === 'finished') return;
-    if (state.inputMode === 'test') {
+    if (actorInputMode(state.currentPlayer) === 'test') {
       state.visit.throws.pop();
       delete state.visit.overrides[state.visit.throws.length];
     }
@@ -292,9 +873,15 @@
     update();
   }
   function startGame() {
+    if (network.role === 'guest' || (network.role === 'host' && !network.connected)) return;
     const inputs = [...document.querySelectorAll(`#${APP_ID}-player-list input[data-player-name]`)];
     if (inputs.length < 2 || inputs.length > 8) return;
     state.players = inputs.map((input, i) => ({ name: input.value.trim() || `Spieler ${i + 1}`, marks: {}, score: 0 }));
+    if (network.role === 'host') {
+      state.players = state.players.slice(0, 2);
+      state.players[0].name = sanitizeName(state.players[0].name, 'Host');
+      state.players[1].name = sanitizeName(remoteProfile.name, 'Freund');
+    }
     state.targets = generateTargets();
     state.currentPlayer = 0;
     state.turnSerial = 0;
@@ -303,13 +890,15 @@
     state.screen = 'game';
     state.notice = '';
     beginVisit();
-    state.boardGate = state.inputMode === 'board' ? 'await-empty' : 'ready';
+    state.boardGate = actorInputMode(0) === 'board' ? 'await-empty' : 'ready';
     takingOut = false;
     if (state.inputMode === 'board') connectBoard(true);
     else disconnectBoard();
     update();
+    if (network.role === 'host' && state.inputMode === 'board' && lastRawBoardMessage) handleBoardMessage(lastRawBoardMessage, 0);
   }
   function newGame() {
+    if (network.role === 'guest') return;
     state.screen = 'setup';
     state.winner = null;
     state.visit = null;
@@ -321,11 +910,11 @@
     update();
   }
   function addPlayer() {
-    if (state.players.length >= 8) return;
+    if (network.role !== 'local' || state.players.length >= 8) return;
     state.players.push({ name: `Spieler ${state.players.length + 1}`, marks: {}, score: 0 });
     update();
   }
-  function removePlayer() { if (state.players.length > 2) { state.players.pop(); update(); } }
+  function removePlayer() { if (network.role === 'local' && state.players.length > 2) { state.players.pop(); update(); } }
 
   function boardWsUrl() {
     const raw = String(state.boardHost || DEFAULT_BOARD_HOST).trim();
@@ -352,12 +941,15 @@
     if (previous) { try { previous.close(); } catch (_) { /* already closed */ } }
     state.connected = false;
     lastBoard = null;
+    lastRawBoardMessage = null;
     takingOut = false;
     resetHandled = false;
     connectionStatus = state.inputMode === 'test' ? 'Testmodus – ohne Kameras' : 'Nicht verbunden';
+    if (network.role === 'guest') sendGuestMessage({ type: 'board-status', connected: false });
   }
-  function blockForSync(message) {
-    if (state.screen === 'game' && state.inputMode === 'board' && !['await-empty', 'finished', 'review'].includes(state.boardGate)) {
+  function blockForSync(message, actorIndex = localPlayerIndex()) {
+    if (actorIndex !== state.currentPlayer) return;
+    if (state.screen === 'game' && actorInputMode(actorIndex) === 'board' && !['await-empty', 'finished', 'review'].includes(state.boardGate)) {
       state.boardGate = 'sync';
       state.notice = message;
     }
@@ -365,7 +957,9 @@
   function connectBoard(force = false) {
     if (state.inputMode !== 'board') return;
     if (force) {
-      blockForSync('Verbindung neu gestartet. Aktuelle Aufnahme prüfen und unten synchronisieren.');
+      if (network.role !== 'guest') {
+        blockForSync('Verbindung neu gestartet. Aktuelle Aufnahme prüfen und unten synchronisieren.', network.role === 'host' ? 0 : state.currentPlayer);
+      }
       disconnectBoard();
     }
     if (socket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(socket.readyState)) return;
@@ -386,19 +980,32 @@
       if (socket !== active) return;
       state.connected = true;
       connectionStatus = 'Verbindung offen; Board-Meldungen werden geprüft';
+      if (network.role === 'guest') {
+        sendGuestMessage({ type: 'board-status', connected: true });
+        sendGuestProfile();
+      }
       update();
     });
     active.addEventListener('message', (event) => {
-      if (socket === active && state.inputMode === 'board') handleBoardMessage(event.data);
+      if (socket !== active || state.inputMode !== 'board') return;
+      lastRawBoardMessage = String(event.data || '');
+      if (network.role === 'guest') {
+        inspectLocalBoardMessage(lastRawBoardMessage);
+        if (state.currentPlayer === 1) sendGuestMessage({ type: 'board', raw: lastRawBoardMessage });
+      } else {
+        handleBoardMessage(lastRawBoardMessage, network.role === 'host' ? 0 : state.currentPlayer);
+      }
     });
     active.addEventListener('close', () => {
       if (socket !== active) return;
       socket = null;
       state.connected = false;
       lastBoard = null;
+      lastRawBoardMessage = null;
       takingOut = false;
       connectionStatus = 'Verbindung unterbrochen. Neuer Versuch in 3 Sekunden.';
-      blockForSync('Während der Unterbrechung können Würfe oder Spielerwechsel fehlen. Aufnahme nach dem Verbinden prüfen.');
+      if (network.role === 'guest') sendGuestMessage({ type: 'board-status', connected: false });
+      else blockForSync('Während der Unterbrechung können Würfe oder Spielerwechsel fehlen. Aufnahme nach dem Verbinden prüfen.', network.role === 'host' ? 0 : state.currentPlayer);
       update();
       reconnectTimer = setTimeout(() => connectBoard(), 3000);
     });
@@ -406,7 +1013,9 @@
       if (socket !== active) return;
       state.connected = false;
       lastBoard = null;
-      blockForSync('Verbindungsfehler. Aufnahme nach dem Verbinden prüfen.');
+      lastRawBoardMessage = null;
+      if (network.role === 'guest') sendGuestMessage({ type: 'board-status', connected: false });
+      else blockForSync('Verbindungsfehler. Aufnahme nach dem Verbinden prüfen.', network.role === 'host' ? 0 : state.currentPlayer);
       connectionStatus = 'Board nicht erreichbar: Adresse, Autodarts Desktop, Browser-Netzwerkfreigabe und gegebenenfalls Zertifikat prüfen.';
       update();
     });
@@ -427,8 +1036,7 @@
     return board?.running && !/^(Starting|Stopped|Stopping|Calibration)/i.test(board.event)
       && !/^(Starting|Stopped|Stopping|Calibrating)/i.test(board.status);
   }
-  function handleBoardMessage(raw) {
-    if (state.inputMode !== 'board') return;
+  function inspectLocalBoardMessage(raw) {
     let packet;
     try { packet = JSON.parse(raw); } catch (_) { return; }
     if (!packet || typeof packet !== 'object' || (packet.type && packet.type !== 'state')) return;
@@ -438,20 +1046,42 @@
     if (!board) {
       lastBoard = null;
       connectionStatus = 'Unvollständige oder ungültige Board-Meldung; keine Punkte übernommen.';
+    } else {
+      lastBoard = board;
+      connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
+    }
+    render();
+  }
+  function handleBoardMessage(raw, actorIndex = localPlayerIndex()) {
+    if (actorIndex !== state.currentPlayer || actorInputMode(actorIndex) !== 'board') return;
+    let packet;
+    try { packet = JSON.parse(raw); } catch (_) { return; }
+    if (!packet || typeof packet !== 'object' || (packet.type && packet.type !== 'state')) return;
+    const data = packet.data ?? packet;
+    const board = parseBoardState(data);
+    if (network.role === 'host' && actorIndex === 1) {
+      remoteProfile.lastEvent = String(data?.event || data?.status || 'Zustand');
+      remoteProfile.boardConnected = true;
+      remoteBoard = board;
+    } else {
+      lastEvent = String(data?.event || data?.status || 'Zustand');
+      lastBoard = board;
+    }
+    if (!board) {
+      if (!(network.role === 'host' && actorIndex === 1)) connectionStatus = 'Unvollständige oder ungültige Board-Meldung; keine Punkte übernommen.';
       render();
       return;
     }
-    lastBoard = board;
-    connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
+    if (!(network.role === 'host' && actorIndex === 1)) connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
     if (state.screen !== 'game' || state.boardGate === 'finished') { render(); return; }
     if (state.boardGate === 'review') { render(); return; }
     if (!boardOperational(board)) {
-      blockForSync('Die Erkennung wurde angehalten oder neu gestartet. Board und Aufnahme vor dem Fortsetzen prüfen.');
+      blockForSync('Die Erkennung wurde angehalten oder neu gestartet. Board und Aufnahme vor dem Fortsetzen prüfen.', actorIndex);
       update();
       return;
     }
     if (board.event === 'Takeout finished' && board.throws.length === 0) takingOut = false;
-    if (board.event === 'Takeout started' || board.status === 'Takeout in progress') { takingOut = true; render(); return; }
+    if (board.event === 'Takeout started' || board.status === 'Takeout in progress') { takingOut = true; update(); return; }
     if (state.boardGate === 'sync') { render(); return; }
     if (board.event !== 'Manual reset') resetHandled = false;
     if (board.event === 'Manual reset') {
@@ -481,7 +1111,7 @@
     }
     if (takingOut) { render(); return; }
     if (board.throws.length < (state.visit?.throws.length || 0) && !/correct|undo|remove/i.test(board.event)) {
-      blockForSync('Die Wurfanzahl ist unerwartet gesunken. Aufnahme prüfen; möglicherweise fehlt der Spielerwechsel.');
+      blockForSync('Die Wurfanzahl ist unerwartet gesunken. Aufnahme prüfen; möglicherweise fehlt der Spielerwechsel.', actorIndex);
       update();
       return;
     }
@@ -490,10 +1120,12 @@
       update();
     }
   }
-  function resumeBoard() {
-    if (state.boardGate !== 'sync' || !state.connected || !boardOperational(lastBoard) || state.legacyVisit || takingOut) return;
-    if (lastBoard.throws.length === 0 && state.visit?.throws.length) return; // User must finish the scored visit instead.
-    reconcileVisit(lastBoard.throws);
+  function resumeBoard(actorIndex = localPlayerIndex()) {
+    const board = actorBoard(actorIndex);
+    if (actorIndex !== state.currentPlayer || state.boardGate !== 'sync' || !actorBoardConnected(actorIndex)
+      || !boardOperational(board) || state.legacyVisit || takingOut) return;
+    if (board.throws.length === 0 && state.visit?.throws.length) return; // User must finish the scored visit instead.
+    reconcileVisit(board.throws);
     state.boardGate = 'ready';
     state.notice = '';
     update();
@@ -590,6 +1222,9 @@
       .${APP_ID}-seg button{border:1px solid #d4dce6;background:#fff;color:#586476;border-radius:10px;padding:9px 12px;cursor:pointer}.${APP_ID}-seg button.active{background:#fff0c7;color:#7a4a00;border-color:#f3b94c;font-weight:900}
       .${APP_ID}-players{display:grid;gap:8px}.${APP_ID}-player-row{display:flex;gap:8px}.${APP_ID}-player-row input,.${APP_ID}-input{width:100%;border:1px solid #cfd7e2;background:#fff;color:#172033;border-radius:10px;padding:10px 12px;outline:none}.${APP_ID}-player-row input:focus,.${APP_ID}-input:focus{border-color:#f59e0b;box-shadow:0 0 0 3px #f59e0b22}
       .${APP_ID}-hint{font-size:12px;color:#697386;line-height:1.5;margin-top:8px}
+      .${APP_ID}-room-code{font-size:34px;font-weight:950;letter-spacing:.18em;color:#172033;background:#f8fafc;border:1px dashed #aeb9c8;border-radius:14px;padding:12px 16px;text-align:center;margin:10px 0}
+      .${APP_ID}-network-status{padding:10px 12px;border-radius:11px;background:#eef4fb;border:1px solid #d8e4f2;color:#40516a;font-size:13px;margin-top:10px}
+      .${APP_ID}-online-dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:#dc4c4c}.online-connected .${APP_ID}-online-dot{background:#22a95a}
       .${APP_ID}-game-layout{display:grid;grid-template-columns:minmax(330px,.82fr) minmax(520px,1.7fr);gap:18px;align-items:start}
       .${APP_ID}-board-card{position:sticky;top:76px;background:#fff;border:1px solid #dde4ec;border-radius:22px;padding:16px;box-shadow:0 8px 28px #23324a12}
       .${APP_ID}-status{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 14px;border-radius:14px;background:#eef4fb;border:1px solid #d8e4f2;margin-bottom:12px}.${APP_ID}-status strong{font-size:18px}.${APP_ID}-status.takeout{background:#fff3d8;border-color:#f6ca6a}.${APP_ID}-status.sync{background:#fff0f0;border-color:#efb6b6}.${APP_ID}-status.review{background:#eef6ff;border-color:#9fc8f4}
@@ -616,7 +1251,7 @@
     if (!document.getElementById(`${APP_ID}-launcher`)) {
       const launcher = document.createElement('button');
       launcher.id = `${APP_ID}-launcher`;
-      launcher.textContent = '🎯 Random Cutthroat';
+      launcher.textContent = '🎯 Cricket Random Cutthroat';
       launcher.addEventListener('click', () => {
         state.minimized = false;
         saveState();
@@ -633,26 +1268,61 @@
   }
 
   function setupHtml() {
-    const playerRows = state.players.map((player, index) => `
+    const setupPlayers = network.role === 'local' ? state.players : state.players.slice(0, 2);
+    const editableIndex = network.role === 'guest' ? 1 : 0;
+    const playerRows = setupPlayers.map((player, index) => `
       <div class="${APP_ID}-player-row">
-        <input data-player-name="${index}" value="${escapeHtml(player.name)}" aria-label="Spieler ${index + 1}">
+        <input data-player-name="${index}" value="${escapeHtml(player.name)}" aria-label="Spieler ${index + 1}"
+          ${network.role !== 'local' && index !== editableIndex ? 'disabled' : ''}>
       </div>
     `).join('');
+
+    const onlineCard = network.role === 'host' ? `
+      <div class="${APP_ID}-room-code">${escapeHtml(network.roomCode || '------')}</div>
+      <div class="${APP_ID}-actions">
+        <button class="${APP_ID}-btn" data-action="copy-room" ${network.roomCode ? '' : 'disabled'}>Code kopieren</button>
+        <button class="${APP_ID}-btn" data-action="online-host">Neuer Code</button>
+        <button class="${APP_ID}-btn danger" data-action="online-local">Online verlassen</button>
+      </div>
+      <div class="${APP_ID}-network-status">${escapeHtml(networkStatus)}</div>
+      <div class="${APP_ID}-hint">Diesen Code dem Freund schicken. Der Raum ist für genau zwei Spieler ausgelegt.</div>
+    ` : network.role === 'guest' ? `
+      <input id="${APP_ID}-room" class="${APP_ID}-input" value="${escapeHtml(network.roomCode)}" maxlength="6" placeholder="Raumcode" autocomplete="off">
+      <div class="${APP_ID}-actions" style="margin-top:10px">
+        <button class="${APP_ID}-btn primary" data-action="online-join">Raum beitreten</button>
+        <button class="${APP_ID}-btn danger" data-action="online-local">Online verlassen</button>
+      </div>
+      <div class="${APP_ID}-network-status">${escapeHtml(networkStatus)}</div>
+      <div class="${APP_ID}-hint">Der Host startet das Spiel, sobald die Verbindung steht.</div>
+    ` : `<div class="${APP_ID}-hint" style="font-size:13px;margin-top:0">Lokal spielen oder einen privaten Raum für einen Freund öffnen. Die Spielstände werden im Online-Modus direkt und verschlüsselt zwischen beiden Browsern übertragen.</div>`;
+
+    const startDisabled = network.role === 'guest' || (network.role === 'host' && !network.connected);
+    const startLabel = network.role === 'guest' ? 'Host startet das Spiel'
+      : network.role === 'host' && !network.connected ? 'Auf Freund warten' : 'Ziele auslosen & starten';
 
     return `
       <div class="${APP_ID}-grid2">
         <div class="${APP_ID}-card">
+          <h3>Spielart</h3>
+          <div class="${APP_ID}-seg">
+            <button data-action="online-local" class="${network.role === 'local' ? 'active' : ''}">Lokal</button>
+            <button data-action="online-host" class="${network.role === 'host' ? 'active' : ''}">Online hosten</button>
+            <button data-action="online-guest-mode" class="${network.role === 'guest' ? 'active' : ''}">Online beitreten</button>
+          </div>
+          ${onlineCard}
+        </div>
+        <div class="${APP_ID}-card">
           <h3>Spieler</h3>
           <div id="${APP_ID}-player-list" class="${APP_ID}-players">${playerRows}</div>
-          <div class="${APP_ID}-actions" style="margin-top:10px">
+          ${network.role === 'local' ? `<div class="${APP_ID}-actions" style="margin-top:10px">
             <button class="${APP_ID}-btn" data-action="add-player">+ Spieler</button>
             <button class="${APP_ID}-btn" data-action="remove-player" ${state.players.length <= 2 ? 'disabled' : ''}>− Spieler</button>
-          </div>
+          </div>` : `<div class="${APP_ID}-hint">${network.role === 'host' ? 'Oben: du. Unten: dein verbundener Freund.' : 'Oben: Host. Unten: du.'}</div>`}
         </div>
         <div class="${APP_ID}-card">
           <h3>Bull</h3>
           <div class="${APP_ID}-seg">
-            ${['always','never','random'].map((mode) => `<button data-bull="${mode}" class="${state.bullMode === mode ? 'active' : ''}">${mode === 'always' ? 'Immer' : mode === 'never' ? 'Nie' : 'Zufällig'}</button>`).join('')}
+            ${['always','never','random'].map((mode) => `<button data-bull="${mode}" class="${state.bullMode === mode ? 'active' : ''}" ${network.role === 'guest' ? 'disabled' : ''}>${mode === 'always' ? 'Immer' : mode === 'never' ? 'Nie' : 'Zufällig'}</button>`).join('')}
           </div>
           <div class="${APP_ID}-hint">Es werden 7 verschiedene Ziele aus 1–20 gezogen. Bei „Zufällig“ nimmt Bull gleichberechtigt an der Ziehung teil.</div>
         </div>
@@ -671,18 +1341,21 @@
         </div>
       </div>
       <div class="${APP_ID}-actions" style="margin-top:16px;justify-content:flex-end">
-        <button class="${APP_ID}-btn primary" data-action="start">Ziele auslosen & starten</button>
+        <button class="${APP_ID}-btn primary" data-action="start" ${startDisabled ? 'disabled' : ''}>${startLabel}</button>
       </div>
     `;
   }
 
   function gameHtml() {
     const current = state.players[state.currentPlayer];
+    const currentMode = actorInputMode(state.currentPlayer);
+    const activeBoard = actorBoard(state.currentPlayer);
+    const localMayAct = network.role !== 'guest' || (network.connected && isLocalTurn());
     const statusClass = state.boardGate === 'sync' ? 'sync' : state.boardGate === 'review' ? 'review' : (takingOut || state.turnDarts >= 3 ? 'takeout' : '');
     const statusText = state.winner !== null ? `${state.players[state.winner].name} gewinnt!`
       : state.boardGate === 'sync' ? 'Aufnahme synchronisieren'
       : state.boardGate === 'review' ? 'Vorherigen Spieler korrigieren'
-      : state.inputMode === 'board' && state.boardGate === 'await-empty' ? 'Board leeren'
+      : currentMode === 'board' && state.boardGate === 'await-empty' ? 'Board leeren'
       : takingOut || state.turnDarts >= 3 ? 'Darts herausziehen'
       : `${current?.name || 'Spieler'} ist dran`;
 
@@ -699,7 +1372,7 @@
 
     const scoreCells = state.players.map((player, index) => `<td class="${index === state.currentPlayer ? 'active-player' : ''}"><span class="${APP_ID}-score">${player.score}</span></td>`).join('');
     const winner = state.winner !== null ? `<div class="${APP_ID}-winner">🏆 ${escapeHtml(state.players[state.winner].name)} gewinnt!</div>` : '';
-    const visitEditable = ['ready', 'review'].includes(state.boardGate) && !takingOut && !state.legacyVisit;
+    const visitEditable = localMayAct && ['ready', 'review'].includes(state.boardGate) && !takingOut && !state.legacyVisit;
     const canUndo = visitEditable && state.visit?.throws.some((_, i) => effectiveThrow(i) !== null);
     const canReset = visitEditable && Boolean(state.visit?.throws?.length);
     const canPrevious = Boolean(state.previousVisit) && !takingOut && !state.legacyVisit && !state.visit?.throws?.length;
@@ -712,8 +1385,8 @@
         ${choices.map((value) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${value}</option>`).join('')}
       </select></label>`;
     }).join(' ');
-    const canResume = state.connected && boardOperational(lastBoard) && !state.legacyVisit && !takingOut
-      && (lastBoard.throws.length > 0 || !state.visit?.throws.length);
+    const canResume = localMayAct && actorBoardConnected(state.currentPlayer) && boardOperational(activeBoard) && !state.legacyVisit && !takingOut
+      && (activeBoard.throws.length > 0 || !state.visit?.throws.length);
 
     const playerCards = state.players.map((player, index) => {
       const closed = state.targets.filter((target) => getMarks(player, target) >= 3).length;
@@ -742,11 +1415,11 @@
 
     return `
       ${winner}
-      ${state.inputMode === 'board' && state.boardGate === 'sync' ? `<div class="${APP_ID}-card" role="status" style="margin-bottom:14px">
+      ${currentMode === 'board' && state.boardGate === 'sync' ? `<div class="${APP_ID}-card" role="status" style="margin-bottom:14px">
         <b>Aufnahme synchronisieren</b>
-        <p>${lastBoard ? `Board meldet: ${lastBoard.throws.map((s) => escapeHtml(s.name)).join(', ') || 'keine Darts'}.` : 'Auf eine gültige Board-Meldung warten.'}</p>
+        <p>${activeBoard ? `Board meldet: ${activeBoard.throws.map((s) => escapeHtml(s.name)).join(', ') || 'keine Darts'}.` : 'Auf eine gültige Board-Meldung warten.'}</p>
         <div class="${APP_ID}-hint">Nur fortsetzen, wenn die gemeldeten Darts zur aktuellen Aufnahme gehören. Bei bereits entnommenen Darts die Aufnahme abschließen.</div>
-        <button class="${APP_ID}-btn" data-action="resume" ${canResume ? '' : 'disabled'}>${lastBoard?.throws.length ? 'Aufnahme für aktuellen Spieler übernehmen' : 'Mit leerem Board fortsetzen'}</button>
+        <button class="${APP_ID}-btn" data-action="resume" ${canResume ? '' : 'disabled'}>${activeBoard?.throws.length ? 'Aufnahme für aktuellen Spieler übernehmen' : 'Mit leerem Board fortsetzen'}</button>
       </div>` : ''}
       <div class="${APP_ID}-game-layout">
         <section class="${APP_ID}-board-card">
@@ -777,15 +1450,15 @@
         </section>
       </div>
       <div class="${APP_ID}-actions" style="margin-top:14px">
-        <button class="${APP_ID}-btn" data-action="previous" ${canPrevious ? '' : 'disabled'}>← Vorheriger Spieler</button>
+        <button class="${APP_ID}-btn" data-action="previous" ${canPrevious && localMayAct ? '' : 'disabled'}>← Vorheriger Spieler</button>
         <button class="${APP_ID}-btn" data-action="reset-visit" ${canReset ? '' : 'disabled'}>Würfe zurücksetzen</button>
-        <button class="${APP_ID}-btn" data-action="undo" ${canUndo ? '' : 'disabled'}>${state.inputMode === 'test' ? '↶ Undo' : 'Letzten Dart streichen'}</button>
-        <button class="${APP_ID}-btn" data-action="next" ${state.winner !== null || (state.inputMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
-        <button class="${APP_ID}-btn danger" data-action="new-game">Neues Spiel</button>
+        <button class="${APP_ID}-btn" data-action="undo" ${canUndo ? '' : 'disabled'}>${currentMode === 'test' ? '↶ Undo' : 'Letzten Dart streichen'}</button>
+        <button class="${APP_ID}-btn" data-action="next" ${!localMayAct || state.winner !== null || (currentMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
+        <button class="${APP_ID}-btn danger" data-action="new-game" ${network.role === 'guest' ? 'disabled' : ''}>Neues Spiel</button>
       </div>
       <div class="${APP_ID}-test">${corrections}</div>
-      ${state.inputMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Bei Fehlwürfen außerhalb des Boards im Board Manager einen MISS ergänzen.</div>` : ''}
-      ${state.inputMode === 'test' ? `<details open data-details="tests" style="margin-top:14px;color:#697386">
+      ${currentMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Bei Fehlwürfen außerhalb des Boards im Board Manager einen MISS ergänzen.</div>` : ''}
+      ${isLocalTurn() && state.inputMode === 'test' ? `<details open data-details="tests" style="margin-top:14px;color:#697386">
         <summary style="cursor:pointer">Testwürfe (ohne Board)</summary>
         <div class="${APP_ID}-test">
           ${state.targets.flatMap((target) => (target === 25 ? [1,2] : [1,2,3]).map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
@@ -819,11 +1492,13 @@
       launcher.style.display = state.minimized ? 'block' : 'none';
 
       panel.innerHTML = `
-        <div class="${APP_ID}-wrap ${state.connected ? 'connected' : ''}">
+        <div class="${APP_ID}-wrap ${state.connected ? 'connected' : ''} ${network.connected ? 'online-connected' : ''}">
           <div class="${APP_ID}-top">
-            <div class="${APP_ID}-title">🎯 Random Cutthroat <span class="${APP_ID}-badge">v${VERSION}</span></div>
+            <div class="${APP_ID}-title">🎯 Cricket Random Cutthroat <span class="${APP_ID}-badge">v${VERSION}</span></div>
             <div class="${APP_ID}-actions">
               <span class="${APP_ID}-badge"><span class="${APP_ID}-dot"></span> ${state.inputMode === 'test' ? 'Testmodus' : state.connected ? 'Board verbunden' : 'Board offline'}</span>
+              ${network.role !== 'local' ? `<span class="${APP_ID}-badge"><span class="${APP_ID}-online-dot"></span> ${network.connected ? `Online ${escapeHtml(network.roomCode)}` : escapeHtml(network.role === 'host' ? 'Raum wartet' : 'Online getrennt')}</span>` : ''}
+              ${network.role !== 'local' && state.screen === 'game' ? `<button class="${APP_ID}-btn" data-action="online-local">Online verlassen</button>` : ''}
               ${state.inputMode === 'board' ? `<button class="${APP_ID}-btn" data-action="connect">Verbinden</button>` : ''}
               <button class="${APP_ID}-btn" data-action="minimize">×</button>
             </div>
@@ -848,18 +1523,22 @@
         state.inputMode = button.dataset.mode === 'test' ? 'test' : 'board';
         disconnectBoard();
         if (state.inputMode === 'board') connectBoard();
+        if (network.role === 'guest') sendGuestProfile();
         update();
       });
     });
     panel.querySelectorAll('[data-correct]').forEach((select) => {
-      select.addEventListener('change', () => { select.blur(); correctThrow(Number(select.dataset.correct), select.value); });
+      select.addEventListener('change', () => {
+        select.blur();
+        dispatchGameAction('correct', { index: Number(select.dataset.correct), value: select.value });
+      });
       select.addEventListener('blur', () => render());
     });
     panel.querySelectorAll('[data-bull]').forEach((button) => {
       button.addEventListener('click', () => {
+        if (network.role === 'guest') return;
         state.bullMode = button.dataset.bull;
-        saveState();
-        render();
+        update();
       });
     });
 
@@ -868,6 +1547,8 @@
         const index = Number(input.dataset.playerName);
         if (state.players[index]) state.players[index].name = input.value;
         saveState();
+        if (network.role === 'guest' && index === 1) sendGuestProfile();
+        if (network.role === 'host' && index === 0) broadcastState();
       });
     });
 
@@ -879,20 +1560,35 @@
       });
     }
 
+    const room = panel.querySelector(`#${APP_ID}-room`);
+    if (room) {
+      room.addEventListener('input', () => {
+        const normalized = normalizeRoomCode(room.value);
+        if (room.value !== normalized) room.value = normalized;
+        network.roomCode = normalized;
+        saveNetwork();
+      });
+    }
+
     panel.querySelectorAll('[data-action]').forEach((button) => {
       button.addEventListener('click', () => {
         const action = button.dataset.action;
+        if (action === 'online-local') useLocalMode();
+        if (action === 'online-host') createOnlineRoom();
+        if (action === 'online-guest-mode') prepareGuestMode();
+        if (action === 'online-join') joinOnlineRoom(room?.value || network.roomCode);
+        if (action === 'copy-room') copyRoomCode();
         if (action === 'add-player') addPlayer();
         if (action === 'remove-player') removePlayer();
         if (action === 'start') {
           if (host) state.boardHost = host.value.trim() || DEFAULT_BOARD_HOST;
           startGame();
         }
-        if (action === 'previous') previousPlayer();
-        if (action === 'reset-visit') resetVisit();
-        if (action === 'undo') undo();
-        if (action === 'next') nextPlayer();
-        if (action === 'resume') resumeBoard();
+        if (action === 'previous') dispatchGameAction('previous');
+        if (action === 'reset-visit') dispatchGameAction('reset-visit');
+        if (action === 'undo') dispatchGameAction('undo');
+        if (action === 'next') dispatchGameAction('next');
+        if (action === 'resume') dispatchGameAction('resume');
         if (action === 'new-game') newGame();
         if (action === 'connect') {
           if (host) state.boardHost = host.value.trim() || DEFAULT_BOARD_HOST;
@@ -911,7 +1607,9 @@
       button.addEventListener('click', () => {
         const number = Number(button.dataset.testTarget);
         const multiplier = Number(button.dataset.testM);
-        processThrow({ number, multiplier, name: number ? `${multiplier === 1 ? 'S' : multiplier === 2 ? 'D' : 'T'}${targetLabel(number)}` : 'MISS' }, 'test');
+        dispatchGameAction('test-throw', {
+          segment: { number, multiplier, name: number ? `${multiplier === 1 ? 'S' : multiplier === 2 ? 'D' : 'T'}${targetLabel(number)}` : 'MISS' },
+        });
       });
     });
   }
@@ -929,6 +1627,8 @@
     ensureUi();
     render();
     connectBoard(false);
+    if (network.role === 'host' && network.roomCode) createOnlineRoom(network.roomCode);
+    if (network.role === 'guest' && network.roomCode) joinOnlineRoom(network.roomCode);
 
     const observer = new MutationObserver(() => {
       if (!document.getElementById(`${APP_ID}-panel`) || !document.getElementById(`${APP_ID}-launcher`)) {

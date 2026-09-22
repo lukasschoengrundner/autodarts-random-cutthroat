@@ -1,8 +1,8 @@
-# Autodarts Random Cutthroat Cricket
+# Autodarts – Cricket Random Cutthroat
 
-Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Random Cutthroat Cricket als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
+Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Cricket Random Cutthroat als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.3.1:** Helles, TV-taugliches Spielinterface mit Dartscheibe und großen offenen Zielzahlen. Die Windows-/Board-Manager-Funktionen aus 0.2.0 bleiben erhalten. Die automatisierten Tests und der lokale Browsertest verwenden simulierte Board-Meldungen. Ein Praxistest mit echten Kameras steht noch aus.
+**Version 0.4.0:** Zusätzlich zum lokalen Spiel gibt es private Online-Räume für zwei Spieler. Beide Spieler können ihr eigenes Autodarts-Board oder den Testmodus verwenden; Würfe, Korrekturen, Spielerwechsel und Spielstand werden zwischen den Browsern synchronisiert. Die automatisierten Tests verwenden simulierte Board- und Online-Meldungen. Ein gemeinsamer Praxistest über zwei echte Internetanschlüsse steht noch aus.
 
 ## Aufbau unter Windows
 
@@ -12,18 +12,43 @@ Kameras → Autodarts Desktop / Board Manager → Userscript im Browser → Spie
 
 Autodarts Desktop übernimmt die Kameraerkennung. Dieses Script übernimmt nur die Spielregeln und die Anzeige. Es benötigt keinen Raspberry Pi und keinen zusätzlichen Python-, Docker- oder Node-Dienst. Node.js ist nur für die Entwicklungstests erforderlich.
 
-Das Script ist ein **lokales Spieloverlay**, kein offizieller Spielmodus des Autodarts-Servers. Es synchronisiert seine Punkte und Spieler nicht mit einem parallel laufenden offiziellen Match. Während einer Partie nur einen Browser-Tab mit diesem Overlay verwenden.
+Das Script ist ein eigenes Spieloverlay, kein offizieller Spielmodus des Autodarts-Servers. Es synchronisiert seine Punkte und Spieler nicht mit einem parallel laufenden offiziellen Match. Während einer Partie nur einen Browser-Tab mit diesem Overlay verwenden.
 
 ## Installation oder Update
 
 1. [Tampermonkey](https://www.tampermonkey.net/) im Browser installieren, in dem du Autodarts öffnest.
 2. [Userscript installieren oder aktualisieren](https://raw.githubusercontent.com/lukasschoengrundner/autodarts-random-cutthroat/main/autodarts-random-cutthroat.user.js).
 3. Die Installation beziehungsweise Aktualisierung in Tampermonkey bestätigen.
-4. [Autodarts](https://play.autodarts.com/) neu laden. Das Fenster **Random Cutthroat** erscheint; nach dem Minimieren lässt es sich unten rechts wieder öffnen.
+4. [Autodarts](https://play.autodarts.com/) neu laden. Das Fenster **Cricket Random Cutthroat** erscheint; nach dem Minimieren lässt es sich unten rechts wieder öffnen.
 
 Wenn kein Overlay erscheint, prüfen, ob das Script in diesem Browserprofil aktiviert ist und Tampermonkey Userscripts ausführen darf. Dazu gibt es die [Tampermonkey-Hilfe](https://www.tampermonkey.net/faq.php#Q209).
 
 Tampermonkey kann Updates über die im Script eingetragenen `@updateURL` und `@downloadURL` von diesem Repository beziehen. Keine zweite Kopie parallel aktivieren.
+
+## Über das Internet mit einem Freund spielen
+
+Voraussetzungen: Beide Spieler installieren dieselbe aktuelle Scriptversion und öffnen Autodarts in ihrem Browser. Jeder Spieler kann entweder sein eigenes lokales Autodarts-Board verbinden oder **Ohne Kameras testen** wählen.
+
+### Host
+
+1. Im Setup **Online hosten** wählen.
+2. Den angezeigten sechsstelligen Raumcode an den Freund schicken.
+3. Warten, bis der Freund als verbunden angezeigt wird.
+4. Eigenen Namen, Bull-Modus und Board-Einstellung wählen.
+5. **Ziele auslosen & starten** drücken.
+
+### Freund
+
+1. Im Setup **Online beitreten** wählen.
+2. Raumcode eingeben und **Raum beitreten** drücken.
+3. Eigenen Namen sowie **Mit Kameras** oder **Ohne Kameras testen** wählen.
+4. Der Host startet das Spiel. Bediene Würfe und Korrekturen nur, wenn du an der Reihe bist.
+
+Online-Räume sind auf **genau zwei Spieler** ausgelegt. Der Host führt den maßgeblichen Spielstand und verteilt ihn nach jeder Änderung. Die Board-Adresse, der lokale Verbindungsstatus und die gewählte Eingabemethode bleiben auf dem jeweiligen Gerät; Board-Rohmeldungen werden nur während des eigenen Zuges an den Host weitergereicht.
+
+Die Browser bauen über [PeerJS](https://peerjs.com/docs/) eine WebRTC-Datenverbindung auf. Die kostenlose PeerJS-Cloud vermittelt den Verbindungsaufbau; die Spieldaten laufen danach direkt und verschlüsselt zwischen den Browsern. Es ist normalerweise keine Portfreigabe nötig. Bei bestimmten strengen Firewalls oder symmetrischem NAT kann die direkte Verbindung ohne eigenen TURN-Server scheitern. Den Raumcode deshalb nur dem Mitspieler geben.
+
+Wenn eine Verbindung während des Zuges abbricht, pausiert die Wertung vorsichtshalber. Nach der Wiederverbindung die angezeigte Aufnahme prüfen und synchronisieren. Das Spiel bleibt beim Host gespeichert. Über **Online verlassen** kann wieder lokal weitergespielt werden.
 
 ### Übernahme von Version 0.1.0
 
@@ -100,7 +125,7 @@ Ein während der laufenden Erkennung empfangener **Manual reset** nimmt die Wert
 - Drei Marks schließen ein Ziel. Single zählt einen, Double zwei und Triple drei Marks. Outer Bull zählt einen, Bullseye zwei Marks.
 - Überzählige Marks geben Strafpunkte an jeden Gegner, der das Ziel noch offen hat: Zielwert mal überzählige Marks; bei Bull ist der Zielwert 25.
 - Gewonnen hat, wer alle sieben Ziele geschlossen und den niedrigsten oder geteilten niedrigsten Punktestand hat.
-- Zwei bis acht lokale Spieler.
+- Zwei bis acht lokale Spieler oder zwei Spieler im Online-Modus.
 
 Beispiel: Deine 18 ist geschlossen. T18 gibt jedem Gegner mit offener 18 jeweils 54 Strafpunkte.
 
@@ -113,8 +138,8 @@ npm run check
 npm test
 ```
 
-Die Tests führen die tatsächlichen Funktionen des Userscripts mit isoliertem Speicher und simulierten WebSockets aus. Sie prüfen unter anderem fehlende/duplizierte Meldungen, Korrekturen, Reset, Spielerwechsel, Wiederverbindung, Migration, Regeln und die Drei-Dart-Grenze. Ein lokaler Browsertest prüfte zusätzlich Testmodus, Korrekturauswahl, Undo, Spielerwechsel und simulierten Verbindungsabbruch.
+Die Tests führen die tatsächlichen Funktionen des Userscripts mit isoliertem Speicher und simulierten WebSockets aus. Sie prüfen unter anderem fehlende/duplizierte Meldungen, Korrekturen, Reset, Spielerwechsel, Wiederverbindung, Migration, Regeln, die Drei-Dart-Grenze sowie Validierung und Reihenfolge der Online-Zustände. Ein lokaler Browsertest prüfte zusätzlich Testmodus, Korrekturauswahl, Undo, Spielerwechsel und simulierten Verbindungsabbruch.
 
-**Noch nicht geprüft:** echte Kameras, die genaue Detection-Version des Boards, Tampermonkey auf der echten Autodarts-Seite und die tatsächlichen Browser-/Zertifikatsbedingungen am Kamera-PC. Die Version ist deshalb weiterhin eine Testversion.
+**Noch nicht geprüft:** ein vollständiges Online-Spiel über zwei reale Internetanschlüsse, echte Kameras, die genaue Detection-Version des Boards, Tampermonkey auf der echten Autodarts-Seite und die tatsächlichen Browser-/Zertifikatsbedingungen am Kamera-PC. Die Version ist deshalb weiterhin eine Testversion.
 
 Als Referenz für das lokale Ereignisformat dient das [Autodarts-Local-API-Beispiel](https://github.com/tnolle/autodarts-local-api/blob/main/example.jsonc). Unerwartete, unvollständige oder mehr als drei Würfe umfassende Zustände werden nicht blind gewertet.

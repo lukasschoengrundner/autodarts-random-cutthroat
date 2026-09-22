@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 – 2026-09-19
+
+- Anzeigename in „Autodarts – Cricket Random Cutthroat“ geändert.
+- Private Online-Räume für zwei Spieler mit sechsstelligen Raumcodes ergänzt.
+- Direkte, verschlüsselte Browser-zu-Browser-Verbindung über PeerJS/WebRTC; kein eigener Spielserver und normalerweise keine Portfreigabe erforderlich.
+- Der Host verwaltet den maßgeblichen Spielstand und synchronisiert Ziele, Marks, Punkte, Würfe, Korrekturen, Spielerwechsel und Takeout-Status.
+- Beide Spieler können unabhängig ein eigenes Autodarts-Board oder den Testmodus verwenden; lokale Board-Adresse und Gerätestatus werden nicht überschrieben.
+- Wiederverbindung und Versions-/Zustandsreihenfolge abgesichert; bei einer Unterbrechung während eines Board-Zugs wird die Aufnahme vorsichtshalber synchronisiert.
+- Online-Protokoll und ungültige beziehungsweise veraltete Zustände durch zusätzliche Regressionstests abgedeckt.
+
 ## 0.3.1 – 2026-09-10
 
 - „Vorheriger Spieler“: Die zuletzt abgeschlossene Aufnahme kann wieder geöffnet und korrigiert werden.
