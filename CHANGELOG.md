@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 – 2026-10-03
+
+- Erste Aufnahme nach bewusstem Start mit leerem Board direkt freigeben und bestehende Board-Verbindung erhalten; bekannte steckende Darts bleiben gesperrt.
+- Drei feste Korrekturfelder direkt bei der aktuellen Aufnahme, auch ohne erkannte Darts. Manuelle Ergänzungen und Kamera-Rohliste getrennt abgleichen.
+- Zielzahlen absteigend anzeigen, Bull am Ende, auch für gespeicherte Spiele.
+- Online-Boardmeldungen pro Aufnahme und Inhalt nur einmal weiterreichen; Rückkopplung zwischen Host und Gast unterbinden.
+- Nach Online-Spielerwechsel das leere Board des nächsten Spielers separat bestätigen, damit alte Darts nicht erneut zählen.
+- Regressionstests für Startwürfe, manuelle Ergänzungen, spätere Kameraerkennung, Speicherung, Sortierung und Online-Meldungsaustausch ergänzt.
+
 ## 0.4.0 – 2026-09-19
 
 - Anzeigename in „Autodarts – Cricket Random Cutthroat“ geändert.
@@ -45,3 +54,4 @@
 - Verbindung zum lokalen Board Manager über WebSocket.
 - Automatischer Spielerwechsel bei `Takeout finished`.
 - Undo, manuelle Testwürfe und Overlay auf `play.autodarts.com`.
+

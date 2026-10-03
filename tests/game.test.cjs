@@ -14,7 +14,8 @@ const instrumented = script.replace("  if (document.readyState === 'loading') {"
     undo, correctThrow, previousPlayer, resetVisit, boardWsUrl, connectBoard, disconnectBoard, resumeBoard, saveState,
     setupHtml, gameHtml, startGame, newGame, normalizeRoomCode, sharedStateSnapshot, validSharedState,
     applySharedStateSnapshot, handleHostData, handleGuestData, dispatchGameAction, useLocalMode, prepareGuestMode,
-    actorInputMode, actorBoard,
+    actorInputMode, actorBoard, orderedTargets,
+    wire: (connection) => { peerConnection = connection; },
   };
   if (document.readyState === 'loading') {`);
 assert.notEqual(instrumented, script);
@@ -220,7 +221,7 @@ test('correcting a winning dart can revoke the provisional winner before takeout
   assert.equal(h.s.boardGate, 'finished'); const before = scores(h); h.send([segment(5)]); assert.equal(scores(h), before);
 });
 test('new game with already present darts waits until empty', () => {
-  const h = game(); h.api.startGame(); h.sockets.at(-1).emit('open');
+  const h = game(); h.send([segment(18)]); h.api.startGame(); h.sockets.at(-1).emit('open');
   h.send([segment(18)]); assert.equal(h.s.turnDarts, 0); assert.equal(h.s.boardGate, 'await-empty');
   h.send([], 'Takeout finished'); h.send([segment(18)]); assert.equal(h.s.turnDarts, 1);
 });
@@ -495,4 +496,101 @@ test('reset visit in board mode removes scoring but keeps detected dart slots fo
   assert.equal(h.s.players[0].marks[18], undefined);
   h.send([segment(18, 2)], 'Throw corrected');
   assert.equal(h.s.players[0].marks[18], 2);
+});
+
+
+
+test('start preserves the empty board connection and counts the first three darts', () => {
+  const h = game(); const socket = h.sockets[0];
+  h.api.startGame(); h.s.targets = [1, 5, 16, 17, 18, 20, 25];
+  assert.equal(h.sockets.length, 1); assert.equal(socket.readyState, 1);
+  for (let n = 1; n <= 3; n++) {
+    socket.emit('message', { data: packet(Array.from({ length: n }, () => segment(18))) });
+    assert.equal(h.s.turnDarts, n);
+  }
+  assert.equal(h.s.players[0].marks[18], 3);
+});
+
+test('an event-only board can deliver its first state with the first dart after start', () => {
+  const h = harness(); h.api.startGame(); h.s.targets = [1, 5, 16, 17, 18, 20, 25];
+  h.sockets[0].emit('open'); h.sockets[0].emit('message', { data: packet([segment(18)]) });
+  assert.equal(h.s.turnDarts, 1); assert.equal(h.s.players[0].marks[18], 1);
+});
+
+test('all three correction fields are present before any camera detection', () => {
+  const h = game(); assert.equal((h.api.gameHtml().match(/data-correct=/g) || []).length, 3);
+  h.api.correctThrow(0, 'T18'); h.api.correctThrow(1, 'MISS'); h.api.correctThrow(2, 'S20');
+  assert.equal(h.s.turnDarts, 3); assert.equal(h.s.players[0].marks[18], 3);
+  assert.equal(h.s.players[0].marks[20], 1);
+  h.api.correctThrow(3, 'T20'); assert.equal(h.s.turnDarts, 3);
+  h.send([]); assert.equal(h.s.turnDarts, 3); assert.equal(h.s.boardGate, 'ready');
+});
+
+test('late detection merges manual slots without losing undetected darts or double scoring', () => {
+  const h = game(); h.api.correctThrow(0, 'T18'); h.api.correctThrow(1, 'S20');
+  h.send([segment(18, 3)]);
+  assert.equal(h.s.turnDarts, 2); assert.equal(h.s.players[0].marks[20], 1);
+  h.send([segment(18, 3), segment(20)]);
+  const before = scores(h); h.send([segment(18, 3), segment(20)]);
+  assert.equal(scores(h), before); assert.equal(h.s.players[0].marks[20], 1);
+  assert.equal(h.s.players[1].score, 0);
+  h.api.correctThrow(0, 'S18'); assert.equal(h.s.players[0].marks[18], 1);
+});
+
+test('manual dart slots survive saving, restoring, and camera synchronization', () => {
+  const h = game(); h.api.correctThrow(2, 'D25');
+  const restored = harness(h.saved()); restored.api.connectBoard(); restored.sockets[0].emit('open');
+  restored.send([segment(18)]); restored.api.resumeBoard();
+  assert.equal(restored.s.boardGate, 'ready'); assert.equal(restored.s.turnDarts, 3);
+  assert.equal(restored.s.players[0].marks[25], 2);
+  restored.api.resetVisit(); assert.equal(restored.s.players[0].marks[25], undefined);
+});
+
+test('targets display descending with Bull last including previously saved games', () => {
+  const h = game();
+  assert.deepEqual([...h.api.orderedTargets()], [20, 18, 17, 16, 5, 1, 25]);
+  const html = h.api.gameHtml();
+  assert.deepEqual([...html.matchAll(/ad-rcc-row-target[^"]*">([^<]+)</g)].map(m => m[1]).slice(0, 7), ['20', '18', '17', '16', '5', '1', 'BULL']);
+  for (const mode of ['always', 'never', 'random']) {
+    const targets = h.api.generateTargets(mode);
+    assert.deepEqual([...targets], [...h.api.orderedTargets(targets)]);
+  }
+});
+
+function onlinePair() {
+  const host = game(); host.api.network().role = 'host';
+  host.api.handleHostData({ type: 'hello', protocol: 1, clientId: 'guestclient123', inputMode: 'board', boardConnected: true });
+  host.s.currentPlayer = 1; host.api.beginVisit(); host.s.boardGate = 'ready';
+  const guest = game(); guest.api.network().role = 'guest'; guest.api.network().clientId = 'guestclient123';
+  const queue = [];
+  host.api.wire({ open: true, send: m => queue.push(() => guest.api.handleGuestData(m)) });
+  guest.api.wire({ open: true, send: m => queue.push(() => host.api.handleHostData(m)) });
+  return { host, guest, drain() {
+    let count = 0;
+    while (queue.length && count++ < 100) queue.shift()();
+    assert.equal(queue.length, 0, 'messages must settle instead of echoing forever');
+  } };
+}
+
+test('online cached empty and takeout states do not create an echo loop', () => {
+  for (const event of ['Takeout finished', 'Takeout started']) {
+    const { host, guest, drain } = onlinePair();
+    guest.sockets[0].emit('message', { data: packet([], event) });
+    host.api.handleHostData({ type: 'request-state', protocol: 1, clientId: 'guestclient123' });
+    drain();
+    host.api.handleHostData({ type: 'request-state', protocol: 1, clientId: 'guestclient123' });
+    drain();
+  }
+});
+
+test('online player changes require the next players own board to be empty', () => {
+  const { host: h } = onlinePair();
+  const remote = raw => h.api.handleHostData({ type: 'board', protocol: 1, clientId: 'guestclient123', raw });
+  remote(packet([segment(18)])); h.api.nextPlayer();
+  h.send([]); h.send([segment(5)]); h.send([], 'Takeout finished');
+  assert.equal(h.s.boardGate, 'await-empty');
+  remote(packet([segment(18)])); assert.equal(h.s.turnDarts, 0);
+  assert.equal(h.s.players[1].marks[18], 1);
+  remote(packet([], 'Takeout finished')); remote(packet([segment(18)]));
+  assert.equal(h.s.players[1].marks[18], 2);
 });

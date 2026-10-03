@@ -2,7 +2,9 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Cricket Random Cutthroat als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.4.0:** Zusätzlich zum lokalen Spiel gibt es private Online-Räume für zwei Spieler. Beide Spieler können ihr eigenes Autodarts-Board oder den Testmodus verwenden; Würfe, Korrekturen, Spielerwechsel und Spielstand werden zwischen den Browsern synchronisiert. Die automatisierten Tests verwenden simulierte Board- und Online-Meldungen. Ein gemeinsamer Praxistest über zwei echte Internetanschlüsse steht noch aus.
+**Version 0.4.1:** Erste Aufnahme ohne verworfene Startwürfe, drei feste Korrekturfelder auch für nicht erkannte Darts, absteigende Zielzahlen (Bull zuletzt) und behobene Online-Rückkopplung.
+
+Seit Version 0.4.0: Zusätzlich zum lokalen Spiel gibt es private Online-Räume für zwei Spieler. Beide Spieler können ihr eigenes Autodarts-Board oder den Testmodus verwenden; Würfe, Korrekturen, Spielerwechsel und Spielstand werden zwischen den Browsern synchronisiert. Die automatisierten Tests verwenden simulierte Board- und Online-Meldungen. Ein gemeinsamer Praxistest über zwei echte Internetanschlüsse steht noch aus.
 
 ## Aufbau unter Windows
 
@@ -73,8 +75,8 @@ In diesem Modus werden keine Board-Verbindungen aufgebaut und keine Kameraereign
 1. Autodarts Desktop starten und die Erkennung dort prüfen.
 2. Den [Board Manager](http://localhost:3180) öffnen. Der Hersteller dokumentiert diese lokale Adresse in der [Autodarts-Desktop-Anleitung](https://docs.autodarts.com/getting-started/detection/autodarts-desktop/#board-manager).
 3. Im Script **Mit Kameras** wählen und `http://localhost:3180` eintragen.
-4. **Verbinden** drücken und anschließend ein Spiel starten.
-5. Das Board zu Beginn leeren. Erst nach einer leeren Board-Meldung werden neue Würfe gewertet.
+4. **Verbinden** drücken.
+5. Alle Darts herausziehen und erst dann **Ziele auslosen & starten** drücken. Mit Start bestätigst du ein leeres Board; die erste Treffermeldung wird direkt gewertet, auch wenn der Board Manager vorher keine Leermeldung sendet. Eine bestehende Verbindung bleibt erhalten. Sind dem Script noch steckende Darts bekannt, wartet es weiterhin auf das leere Board.
 
 ### Browser auf einem anderen Gerät
 
@@ -100,12 +102,12 @@ Unter **Verbindungsdiagnose** stehen Adresse, Verbindungsstatus, letztes Board-E
 - **Würfe zurücksetzen** leert die Aufnahme im Testmodus; im Kameramodus nimmt es die Wertung der erkannten Darts zurück, hält deren Wurfplätze aber für Korrekturen belegt.
 - Das Script gleicht die **gesamte aktuelle Aufnahme** ab. Fehlt eine Zwischenmeldung, können die später darin enthaltenen Würfe nachgetragen werden. Identische Meldungen zählen nicht erneut.
 - Ändert das Board ein Segment, wird die Aufnahme einschließlich Strafpunkten neu berechnet. Änderungen werden aus konsistenten `state`-Meldungen übernommen, statt nur den letzten Dart einer Liste hinzuzuzählen.
-- Über die Auswahl **Dart 1/2/3 korrigieren** kann ein Dart lokal ersetzt, gestrichen oder auf seinen Originalwert zurückgestellt werden. Diese Korrektur verändert nicht den Board Manager oder ein offizielles Match.
+- Direkt unter **Aktuelle Aufnahme** stehen immer drei Felder **Dart 1/2/3**. Damit können auch bei null erkannten Darts Treffer oder MISS ergänzt und vorhandene Würfe ersetzt, gestrichen oder auf ihren Originalwert zurückgestellt werden. Manuelle Ergänzungen bleiben bei identischen oder kürzeren, unveränderten Kameralisten bestehen. Erkennt die Kamera einen zuvor fehlenden Platz, wird dessen Wert übernommen; prüfe bei ausgelassenen Würfen die Reihenfolge der drei Felder. Diese Korrektur verändert nicht den Board Manager oder ein offizielles Match.
 - **Letzten Dart streichen** nimmt im Kameramodus dessen Wertung zurück, lässt den physischen Wurfplatz aber belegt. Wiederholte Board-Meldungen fügen ihn dadurch nicht erneut hinzu. Eine spätere echte Änderung dieses Board-Segments ersetzt die lokale Korrektur.
 - Im Testmodus entfernt **Undo** den letzten Testwurf und gibt den Wurfplatz wieder frei. Undo und Korrekturen gelten nur für die aktuelle Aufnahme.
 - **Takeout finished** mit leerem Board schließt die Aufnahme ab und wechselt automatisch den Spieler. Beim Herausziehen werden vorübergehend schrumpfende Listen nicht neu gewertet.
 - **Nächster Spieler** wechselt manuell genau einmal und wartet anschließend auf das leere Board. Meldungen der noch steckenden Darts werden nicht dem nächsten Spieler zugeordnet.
-- Fehlwürfe außerhalb des Boards bei Bedarf im Board Manager als MISS ergänzen. Eine Aufnahme kann auch vor dem dritten Dart manuell abgeschlossen werden.
+- Fehlwürfe außerhalb des Boards bei Bedarf direkt über Dart 1/2/3 als MISS ergänzen. Eine Aufnahme kann auch vor dem dritten Dart manuell abgeschlossen werden.
 - Ein Sieger kann vor dem Herausziehen noch durch eine Wurfkorrektur geändert werden. Nach dem abschließenden Herausziehen bleibt das Spiel beendet.
 
 ### Verbindung unterbrochen, Seite neu geladen oder Board zurückgesetzt
@@ -120,7 +122,7 @@ Ein während der laufenden Erkennung empfangener **Manual reset** nimmt die Wert
 
 ## Regeln
 
-- Sieben verschiedene Ziele pro Spiel aus 1–20, optional Bull.
+- Sieben verschiedene Ziele pro Spiel aus 1–20, optional Bull. Anzeige absteigend, Bull am Ende; auch in bereits gespeicherten Spielen.
 - **Bull immer:** Bull plus sechs zufällige Zahlen. **Bull nie:** sieben Zahlen. **Bull zufällig:** sieben Ziele aus 1–20 plus Bull, mit gleicher Auswahlchance pro Ziel.
 - Drei Marks schließen ein Ziel. Single zählt einen, Double zwei und Triple drei Marks. Outer Bull zählt einen, Bullseye zwei Marks.
 - Überzählige Marks geben Strafpunkte an jeden Gegner, der das Ziel noch offen hat: Zielwert mal überzählige Marks; bei Bull ist der Zielwert 25.
@@ -143,3 +145,4 @@ Die Tests führen die tatsächlichen Funktionen des Userscripts mit isoliertem S
 **Noch nicht geprüft:** ein vollständiges Online-Spiel über zwei reale Internetanschlüsse, echte Kameras, die genaue Detection-Version des Boards, Tampermonkey auf der echten Autodarts-Seite und die tatsächlichen Browser-/Zertifikatsbedingungen am Kamera-PC. Die Version ist deshalb weiterhin eine Testversion.
 
 Als Referenz für das lokale Ereignisformat dient das [Autodarts-Local-API-Beispiel](https://github.com/tnolle/autodarts-local-api/blob/main/example.jsonc). Unerwartete, unvollständige oder mehr als drei Würfe umfassende Zustände werden nicht blind gewertet.
+

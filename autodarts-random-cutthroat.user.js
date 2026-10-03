@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts – Cricket Random Cutthroat
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.4.0
+// @version      0.4.1
 // @description  Cricket Random Cutthroat overlay for Autodarts. Local games or encrypted online rooms with a friend.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -19,7 +19,7 @@
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
   const NETWORK_STORAGE_KEY = 'autodarts-random-cutthroat:network:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.4.0';
+  const VERSION = '0.4.1';
   const ONLINE_PROTOCOL = 1;
   const ROOM_PREFIX = 'ad-rcc-';
   const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -48,6 +48,7 @@
   let storageWarning = '';
   let resetHandled = false;
   let lastRawBoardMessage = null;
+  let lastForwardedBoardKey = null;
 
   let network = loadNetwork();
   let peer = null;
@@ -230,7 +231,8 @@
   function validVisit(visit, playerCount, playerIndex) {
     return visit && validPlayers(visit.base?.players) && visit.base.players.length === playerCount
       && visit.base.currentPlayer === playerIndex && Array.isArray(visit.throws) && visit.throws.length <= 3
-      && visit.throws.every((s) => normalizeSegment(s)) && visit.overrides && typeof visit.overrides === 'object'
+      && visit.throws.every((s) => normalizeSegment(s))
+      && (visit.boardThrows === undefined || (Array.isArray(visit.boardThrows) && visit.boardThrows.length <= 3 && visit.boardThrows.every((s) => normalizeSegment(s)))) && visit.overrides && typeof visit.overrides === 'object'
       && Object.entries(visit.overrides).every(([i, s]) => /^\d$/.test(i) && Number(i) < visit.throws.length && (s === null || normalizeSegment(s)));
   }
 
@@ -292,6 +294,7 @@
     peerConnection = null;
     peer = null;
     network.connected = false;
+    lastForwardedBoardKey = null;
     if (connection) { try { connection.close(); } catch (_) { /* already closed */ } }
     if (activePeer) { try { activePeer.destroy(); } catch (_) { /* already destroyed */ } }
     remoteBoard = null;
@@ -512,6 +515,7 @@
     connection.on('open', () => {
       if (peerConnection !== connection || generation !== peerGeneration) return;
       network.connected = true;
+      lastForwardedBoardKey = null;
       networkStatus = `Mit Raum ${network.roomCode} verbunden`;
       sendGuestProfile('hello');
       render();
@@ -541,6 +545,16 @@
   function localOnlineName() {
     const index = network.role === 'guest' ? 1 : 0;
     return sanitizeName(state.players[index]?.name, network.role === 'guest' ? 'Freund' : 'Host');
+  }
+
+  function forwardGuestBoard() {
+    if (network.role !== 'guest' || !network.connected || !isLocalTurn()
+      || state.screen !== 'game' || state.inputMode !== 'board' || !lastRawBoardMessage) return;
+    const key = JSON.stringify([network.appliedSession, state.turnSerial, state.currentPlayer, lastRawBoardMessage]);
+    if (key === lastForwardedBoardKey) return;
+    // Mark before sending: receiving the resulting state must not echo it back.
+    lastForwardedBoardKey = key;
+    if (!sendGuestMessage({ type: 'board', raw: lastRawBoardMessage })) lastForwardedBoardKey = null;
   }
 
   function sendGuestProfile(type = 'profile') {
@@ -650,9 +664,8 @@
     network.appliedRevision = message.revision;
     network.connected = true;
     networkStatus = `Mit Raum ${network.roomCode} verbunden`;
-    if (isLocalTurn() && state.inputMode === 'board' && lastRawBoardMessage) {
-      sendGuestMessage({ type: 'board', raw: lastRawBoardMessage });
-    }
+    if (!isLocalTurn() || state.screen !== 'game') lastForwardedBoardKey = null;
+    forwardGuestBoard();
     if (isLocalTurn() && state.inputMode === 'test' && state.boardGate === 'await-empty') {
       sendGuestMessage({ type: 'action', action: 'ready' });
     }
@@ -705,7 +718,10 @@
     const numbers = Array.from({ length: 20 }, (_, i) => i + 1);
     const targets = mode === 'always' ? [...shuffle(numbers).slice(0, count - 1), 25]
       : shuffle(mode === 'never' ? numbers : [...numbers, 25]).slice(0, count);
-    return targets.sort((a, b) => a - b);
+    return orderedTargets(targets);
+  }
+  function orderedTargets(targets = state.targets) {
+    return [...targets].sort((a, b) => a === b ? 0 : a === 25 ? 1 : b === 25 ? -1 : b - a);
   }
   function targetLabel(target) { return target === 25 ? 'BULL' : String(target); }
   function targetValue(target) { return target; }
@@ -744,7 +760,7 @@
   }
 
   function beginVisit() {
-    state.visit = { base: { players: clone(state.players), currentPlayer: state.currentPlayer }, throws: [], overrides: {} };
+    state.visit = { base: { players: clone(state.players), currentPlayer: state.currentPlayer }, throws: [], overrides: {}, boardThrows: [] };
     state.turnDarts = 0;
     state.legacyVisit = false;
   }
@@ -771,13 +787,18 @@
   }
   function reconcileVisit(throws) {
     if (!state.visit) beginVisit();
-    // Local corrections survive duplicate snapshots, but a changed board slot supersedes them.
+    const previousRaw = state.visit.boardThrows ?? state.visit.throws;
+    // Manual additions are independent of the camera's shorter list. A real
+    // change to an observed slot still supersedes that slot's correction.
     for (const key of Object.keys(state.visit.overrides)) {
-      if (!throws[key] || JSON.stringify(throws[key]) !== JSON.stringify(state.visit.throws[key])) delete state.visit.overrides[key];
+      if (JSON.stringify(throws[key]) !== JSON.stringify(previousRaw[key])) delete state.visit.overrides[key];
     }
-    state.visit.throws = clone(throws);
+    state.visit.boardThrows = clone(throws);
+    const length = Math.max(throws.length, ...Object.keys(state.visit.overrides).map((i) => Number(i) + 1));
+    state.visit.throws = Array.from({ length }, (_, i) => throws[i] || { number: 0, multiplier: 0, name: 'MISS' });
     replayVisit();
   }
+
   function processThrow(segment, source = 'test', actorIndex = localPlayerIndex()) {
     if (source !== 'test' || actorInputMode(actorIndex) !== 'test' || actorIndex !== state.currentPlayer
       || state.screen !== 'game' || state.legacyVisit || state.winner !== null || state.turnDarts >= 3) return;
@@ -862,11 +883,20 @@
     update();
   }
   function correctThrow(index, value) {
-    if (!state.visit || state.legacyVisit || !['ready', 'review'].includes(state.boardGate) || takingOut || !Number.isInteger(index) || index < 0 || index >= state.visit.throws.length) return;
-    if (value === 'board') delete state.visit.overrides[index];
+    if (!state.visit || state.legacyVisit || !['ready', 'review'].includes(state.boardGate) || takingOut || !Number.isInteger(index) || index < 0 || index >= 3) return;
+    if (actorInputMode() === 'board' && state.visit.boardThrows === undefined) state.visit.boardThrows = clone(state.visit.throws);
+    if (value === 'board') {
+      if (index >= state.visit.throws.length) return;
+      delete state.visit.overrides[index];
+    }
     else {
       const segment = value === 'ignore' ? null : normalizeSegment({ name: value });
       if (segment === null && value !== 'ignore') return;
+      while (state.visit.throws.length <= index) {
+        const slot = state.visit.throws.length;
+        state.visit.throws.push({ number: 0, multiplier: 0, name: 'MISS' });
+        state.visit.overrides[slot] = null;
+      }
       state.visit.overrides[index] = segment;
     }
     replayVisit();
@@ -890,12 +920,18 @@
     state.screen = 'game';
     state.notice = '';
     beginVisit();
-    state.boardGate = actorInputMode(0) === 'board' ? 'await-empty' : 'ready';
+    // Starting explicitly confirms an empty board. Keep a healthy connection
+    // and its empty snapshot; don't discard the first visit waiting for an event
+    // that an event-only Board Manager may never send. Known old darts still block.
+    state.boardGate = state.inputMode === 'board' && lastBoard?.throws.length ? 'await-empty' : 'ready';
     takingOut = false;
-    if (state.inputMode === 'board') connectBoard(true);
+    if (state.inputMode === 'board') {
+      try { if (socket && socket.url !== boardWsUrl()) disconnectBoard(); }
+      catch (_) { disconnectBoard(); } // connectBoard reports invalid addresses in the UI.
+      connectBoard();
+    }
     else disconnectBoard();
     update();
-    if (network.role === 'host' && state.inputMode === 'board' && lastRawBoardMessage) handleBoardMessage(lastRawBoardMessage, 0);
   }
   function newGame() {
     if (network.role === 'guest') return;
@@ -991,7 +1027,7 @@
       lastRawBoardMessage = String(event.data || '');
       if (network.role === 'guest') {
         inspectLocalBoardMessage(lastRawBoardMessage);
-        if (state.currentPlayer === 1) sendGuestMessage({ type: 'board', raw: lastRawBoardMessage });
+        forwardGuestBoard();
       } else {
         handleBoardMessage(lastRawBoardMessage, network.role === 'host' ? 0 : state.currentPlayer);
       }
@@ -1088,7 +1124,7 @@
       if (resetHandled) return;
       resetHandled = true;
       // Roll back this visit only. The physical board must be cleared explicitly before reuse.
-      if (state.visit && !state.legacyVisit) { state.visit.throws = []; state.visit.overrides = {}; replayVisit(); }
+      if (state.visit && !state.legacyVisit) { state.visit.throws = []; state.visit.overrides = {}; state.visit.boardThrows = []; replayVisit(); }
       state.boardGate = 'sync';
       state.notice = 'Board zurückgesetzt. Aktuelle Aufnahme zurückgenommen. Darts herausziehen und mit leerem Board fortsetzen.';
       takingOut = false;
@@ -1105,17 +1141,22 @@
       if (board.throws.length !== 0) { render(); return; }
       takingOut = false;
       if (state.winner !== null) state.boardGate = 'finished';
-      else if (state.visit?.throws.length) { nextPlayer(); state.boardGate = 'ready'; }
+      else if (state.visit?.throws.length) {
+        nextPlayer();
+        // Only local players share the board just emptied. The online opponent
+        // must confirm their own board is empty before any cached darts can count.
+        if (network.role === 'local') state.boardGate = 'ready';
+      }
       update();
       return;
     }
     if (takingOut) { render(); return; }
-    if (board.throws.length < (state.visit?.throws.length || 0) && !/correct|undo|remove/i.test(board.event)) {
+    if (board.throws.length < ((state.visit?.boardThrows ?? state.visit?.throws)?.length || 0) && !/correct|undo|remove/i.test(board.event)) {
       blockForSync('Die Wurfanzahl ist unerwartet gesunken. Aufnahme prüfen; möglicherweise fehlt der Spielerwechsel.', actorIndex);
       update();
       return;
     }
-    if (JSON.stringify(state.visit?.throws) !== JSON.stringify(board.throws)) {
+    if (JSON.stringify(state.visit?.boardThrows ?? state.visit?.throws) !== JSON.stringify(board.throws)) {
       reconcileVisit(board.throws);
       update();
     }
@@ -1340,6 +1381,7 @@
           <div class="${APP_ID}-hint" style="font-size:13px;margin-top:0">3 Marks schließen ein Ziel. Single=1, Double=2, Triple=3. Überzählige Marks geben Strafpunkte an jeden Gegner, der das Ziel noch nicht geschlossen hat. Gewonnen hat, wer alle 7 Ziele geschlossen hat und den niedrigsten (oder geteilten niedrigsten) Punktestand besitzt.</div>
         </div>
       </div>
+      ${state.inputMode === 'board' ? `<p class="${APP_ID}-hint">Vor dem Start alle Darts herausziehen. Mit Start bestätigst du ein leeres Board.</p>` : ''}
       <div class="${APP_ID}-actions" style="margin-top:16px;justify-content:flex-end">
         <button class="${APP_ID}-btn primary" data-action="start" ${startDisabled ? 'disabled' : ''}>${startLabel}</button>
       </div>
@@ -1360,7 +1402,7 @@
       : `${current?.name || 'Spieler'} ist dran`;
 
     const headers = state.players.map((player, index) => `<th>${escapeHtml(player.name)}${index === state.currentPlayer ? ' 🎯' : ''}</th>`).join('');
-    const targetRows = state.targets.map((target) => {
+    const targetRows = orderedTargets().map((target) => {
       const cells = state.players.map((player, index) => {
         const marks = getMarks(player, target);
         const cls = `${index === state.currentPlayer ? 'active-player ' : ''}${marks >= 3 ? `${APP_ID}-closed` : ''}`;
@@ -1377,10 +1419,12 @@
     const canReset = visitEditable && Boolean(state.visit?.throws?.length);
     const canPrevious = Boolean(state.previousVisit) && !takingOut && !state.legacyVisit && !state.visit?.throws?.length;
     const choices = ['MISS', ...Array.from({ length: 20 }, (_, i) => i + 1).flatMap((n) => ['S', 'D', 'T'].map((m) => `${m}${n}`)), 'S25', 'D25'];
-    const corrections = (state.visit?.throws || []).map((segment, i) => {
-      const selected = Object.hasOwn(state.visit.overrides, i) ? (effectiveThrow(i)?.name || 'ignore') : 'board';
+    const corrections = [0, 1, 2].map((i) => {
+      const segment = currentMode === 'board' && state.visit?.boardThrows
+        ? state.visit.boardThrows[i] : state.visit?.throws[i];
+      const selected = Object.hasOwn(state.visit?.overrides || {}, i) ? (effectiveThrow(i)?.name || 'ignore') : 'board';
       return `<label>Dart ${i + 1}: <select data-correct="${i}" aria-label="Dart ${i + 1} korrigieren" ${visitEditable ? '' : 'disabled'}>
-        <option value="board" ${selected === 'board' ? 'selected' : ''}>${escapeHtml(segment.name)} (Original)</option>
+        <option value="board" ${selected === 'board' ? 'selected' : ''}>${segment ? `${escapeHtml(segment.name)} (Original)` : 'Nicht erkannt / noch nicht geworfen'}</option>
         <option value="ignore" ${selected === 'ignore' ? 'selected' : ''}>Gestrichen</option>
         ${choices.map((value) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${value}</option>`).join('')}
       </select></label>`;
@@ -1397,7 +1441,7 @@
       </div>`;
     }).join('');
 
-    const targetCards = state.targets.map((target) => {
+    const targetCards = orderedTargets().map((target) => {
       const marks = current ? getMarks(current, target) : 0;
       const remaining = Math.max(0, 3 - marks);
       const closed = remaining === 0;
@@ -1432,6 +1476,7 @@
           <div class="${APP_ID}-visit">
             <div class="${APP_ID}-visit-title">Aktuelle Aufnahme</div>
             <div class="${APP_ID}-throw-row">${throws}</div>
+            <div class="${APP_ID}-test">${corrections}</div>
           </div>
         </section>
         <section class="${APP_ID}-game-main">
@@ -1456,12 +1501,11 @@
         <button class="${APP_ID}-btn" data-action="next" ${!localMayAct || state.winner !== null || (currentMode === 'board' && state.boardGate === 'await-empty') ? 'disabled' : ''}>${state.boardGate === 'sync' ? 'Aufnahme abschließen' : 'Nächster Spieler'}</button>
         <button class="${APP_ID}-btn danger" data-action="new-game" ${network.role === 'guest' ? 'disabled' : ''}>Neues Spiel</button>
       </div>
-      <div class="${APP_ID}-test">${corrections}</div>
-      ${currentMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Bei Fehlwürfen außerhalb des Boards im Board Manager einen MISS ergänzen.</div>` : ''}
+      ${currentMode === 'board' ? `<div class="${APP_ID}-hint">Korrekturen gelten nur für dieses Spiel. Ein gestrichener Dart bleibt als geworfener Dart belegt. Fehlende Darts über Dart 1/2/3 ergänzen, auch MISS. Bei nachträglicher Kameraerkennung wird der betreffende Platz neu abgeglichen.</div>` : ''}
       ${isLocalTurn() && state.inputMode === 'test' ? `<details open data-details="tests" style="margin-top:14px;color:#697386">
         <summary style="cursor:pointer">Testwürfe (ohne Board)</summary>
         <div class="${APP_ID}-test">
-          ${state.targets.flatMap((target) => (target === 25 ? [1,2] : [1,2,3]).map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
+          ${orderedTargets().flatMap((target) => (target === 25 ? [1,2] : [1,2,3]).map((m) => `<button class="${APP_ID}-btn" data-test-target="${target}" data-test-m="${m}" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>${m === 1 ? 'S' : m === 2 ? 'D' : 'T'}${targetLabel(target)}</button>`)).join('')}
           <button class="${APP_ID}-btn" data-test-target="0" data-test-m="0" ${state.turnDarts >= 3 || state.winner !== null || state.legacyVisit ? 'disabled' : ''}>MISS</button>
         </div>
       </details>` : ''}
@@ -1644,3 +1688,4 @@
     boot();
   }
 })();
+
