@@ -2,7 +2,9 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Cricket Random Cutthroat als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.4.2:** Nach der Korrektur des vorherigen Spielers zählt der nächste Wurf am bereits als leer gemeldeten lokalen Board sofort.
+**Version 0.4.3:** Die Startreihenfolge lässt sich vor einer lokalen Partie ändern.
+
+Seit Version 0.4.2: Nach der Korrektur des vorherigen Spielers zählt der nächste Wurf am bereits als leer gemeldeten lokalen Board sofort.
 
 Seit Version 0.4.1: Erste Aufnahme ohne verworfene Startwürfe, drei feste Korrekturfelder auch für nicht erkannte Darts, absteigende Zielzahlen (Bull zuletzt) und behobene Online-Rückkopplung.
 
@@ -63,7 +65,7 @@ Wenn eine Verbindung während des Zuges abbricht, pausiert die Wertung vorsichts
 ## Sofort ohne Kameras testen
 
 1. Im Setup **Ohne Kameras testen** auswählen.
-2. Spielernamen und Bull-Modus einstellen.
+2. Spielernamen und Bull-Modus einstellen. Im lokalen Spiel den Griff mit den drei Pfeilen neben einem Namen auf den gewünschten Platz ziehen. Mit der Tastatur den Griff per Tab auswählen und mit ↑ oder ↓ verschieben. Der oberste Spieler beginnt.
 3. **Ziele auslosen & starten** drücken.
 4. Unter **Testwürfe** Single, Double, Triple oder MISS anklicken.
 5. Nach drei Darts sind weitere Testwürfe gesperrt. Mit **Nächster Spieler** wechseln oder mit **Undo** den letzten Testwurf zurücknehmen.

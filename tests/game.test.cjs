@@ -14,7 +14,7 @@ const instrumented = script.replace("  if (document.readyState === 'loading') {"
     undo, correctThrow, previousPlayer, resetVisit, boardWsUrl, connectBoard, disconnectBoard, resumeBoard, saveState,
     setupHtml, gameHtml, startGame, newGame, normalizeRoomCode, sharedStateSnapshot, validSharedState,
     applySharedStateSnapshot, handleHostData, handleGuestData, dispatchGameAction, useLocalMode, prepareGuestMode,
-    actorInputMode, actorBoard, orderedTargets,
+    actorInputMode, actorBoard, orderedTargets, movePlayer, bindPlayerOrder,
     wire: (connection) => { peerConnection = connection; },
   };
   if (document.readyState === 'loading') {`);
@@ -48,7 +48,8 @@ function harness(saved, options = {}) {
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => { if (options.storageThrows) throw new Error('Quota exceeded'); storage.set(key, value); },
     },
-    document: { readyState: 'loading', addEventListener: () => {}, querySelectorAll: () => [{ value: 'Alice' }, { value: 'Bob' }] },
+    document: { readyState: 'loading', addEventListener: () => {}, querySelectorAll: options.playerInputs || (() => [{ value: 'Alice' }, { value: 'Bob' }]),
+      elementFromPoint: options.elementFromPoint },
     requestAnimationFrame: () => {},
     setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
     clearTimeout: (id) => timers.delete(id),
@@ -656,4 +657,57 @@ test('a takeout completed during local review frees the shared board without sco
   h.send([segment(20)]);
   assert.equal(h.s.players[0].marks[18], 2);
   assert.equal(h.s.players[1].marks[20], 1);
+});
+
+test('local setup keeps the reordered names through reload, start and a full player rotation', () => {
+  const h = harness();
+  h.s.players = ['Anna', 'Ben', 'Chris'].map(name => ({ name, marks: {}, score: 0 }));
+  h.api.movePlayer(2, 0);
+  h.api.movePlayer(1, 2);
+  const names = ['Chris', 'Ben', 'Anna'];
+  assert.deepEqual(h.saved().players.map(p => p.name), names);
+  const restored = harness(h.saved(), {
+    playerInputs: () => [...restored.api.setupHtml().matchAll(/data-player-name="\d+" value="([^"]*)"/g)]
+      .map(match => ({ value: match[1] })),
+  });
+  restored.s.inputMode = 'test';
+  restored.api.startGame();
+  for (const name of [...names, names[0]]) {
+    assert.equal(restored.s.players[restored.s.currentPlayer].name, name);
+    restored.api.nextPlayer();
+  }
+});
+
+test('only local setup accepts a move to a valid position', () => {
+  const h = harness();
+  for (const [screen, role, to] of [['setup', 'local', -1], ['setup', 'local', 2],
+    ['setup', 'local', 0], ['game', 'local', 1], ['setup', 'host', 1], ['setup', 'guest', 1]]) {
+    h.s.screen = screen;
+    h.api.network().role = role;
+    h.api.movePlayer(0, to);
+    assert.equal(h.s.players[0].name, 'Spieler 1');
+    if (role !== 'local') assert.doesNotMatch(h.api.setupHtml(), /data-move-player/);
+  }
+});
+
+test('a grip moves on drop or arrow key, and a cancelled touch leaves the order intact', () => {
+  const row = { dataset: { playerRow: '1' }, closest: () => row, setAttribute() {} };
+  const h = harness(null, { elementFromPoint: () => row });
+  const grip = { dataset: { movePlayer: '0' }, closest: () => grip,
+    setPointerCapture(id) { assert.equal(id, 1); }, removeAttribute() {} };
+  const handlers = {};
+  const list = { addEventListener: (name, fn) => { handlers[name] = fn; },
+    querySelector: () => null, contains: node => node === row };
+  h.api.bindPlayerOrder({ querySelector: () => list });
+  const pointer = { target: grip, pointerId: 1, isPrimary: true, button: 0, clientX: 10, clientY: 80 };
+  handlers.pointerdown(pointer);
+  handlers.pointermove(pointer);
+  handlers.pointercancel({ ...pointer, type: 'pointercancel' });
+  assert.equal(h.s.players[0].name, 'Spieler 1');
+  handlers.pointerdown(pointer);
+  handlers.pointerup({ ...pointer, type: 'pointerup' });
+  assert.equal(h.s.players[1].name, 'Spieler 1');
+  grip.dataset.movePlayer = '1';
+  handlers.keydown({ target: grip, key: 'ArrowUp', preventDefault() {} });
+  assert.equal(h.s.players[0].name, 'Spieler 1');
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts – Cricket Random Cutthroat
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.4.2
+// @version      0.4.3
 // @description  Cricket Random Cutthroat overlay for Autodarts. Local games or encrypted online rooms with a friend.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -19,7 +19,7 @@
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
   const NETWORK_STORAGE_KEY = 'autodarts-random-cutthroat:network:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.4.2';
+  const VERSION = '0.4.3';
   const ONLINE_PROTOCOL = 1;
   const ROOM_PREFIX = 'ad-rcc-';
   const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -956,6 +956,14 @@
   }
   function removePlayer() { if (network.role === 'local' && state.players.length > 2) { state.players.pop(); update(); } }
 
+  function movePlayer(from, to) {
+    if (network.role !== 'local' || state.screen !== 'setup' || from === to) return;
+    if (![from, to].every(i => Number.isInteger(i) && i >= 0 && i < state.players.length)) return;
+    const [player] = state.players.splice(from, 1);
+    state.players.splice(to, 0, player);
+    update();
+  }
+
   function boardWsUrl() {
     const raw = String(state.boardHost || DEFAULT_BOARD_HOST).trim();
     const explicit = /^[a-z][a-z\d+.-]*:\/\//i.test(raw);
@@ -1266,6 +1274,11 @@
       .${APP_ID}-card h3{margin:0 0 12px;font-size:15px;color:#4a5668}.${APP_ID}-seg{display:flex;gap:8px;flex-wrap:wrap}
       .${APP_ID}-seg button{border:1px solid #d4dce6;background:#fff;color:#586476;border-radius:10px;padding:9px 12px;cursor:pointer}.${APP_ID}-seg button.active{background:#fff0c7;color:#7a4a00;border-color:#f3b94c;font-weight:900}
       .${APP_ID}-players{display:grid;gap:8px}.${APP_ID}-player-row{display:flex;gap:8px}.${APP_ID}-player-row input,.${APP_ID}-input{width:100%;border:1px solid #cfd7e2;background:#fff;color:#172033;border-radius:10px;padding:10px 12px;outline:none}.${APP_ID}-player-row input:focus,.${APP_ID}-input:focus{border-color:#f59e0b;box-shadow:0 0 0 3px #f59e0b22}
+      .${APP_ID}-player-row input{min-width:0}
+      .${APP_ID}-grip{display:grid;align-content:center;justify-items:center;min-width:44px;padding:4px;cursor:grab;touch-action:none;user-select:none}
+      .${APP_ID}-grip span{display:block;font:18px/9px system-ui;color:#586476}
+      .${APP_ID}-grip[data-sorting]{cursor:grabbing}
+      .${APP_ID}-player-row[data-drop]{outline:2px solid #d28c0a;border-radius:10px}
       .${APP_ID}-hint{font-size:12px;color:#697386;line-height:1.5;margin-top:8px}
       .${APP_ID}-room-code{font-size:34px;font-weight:950;letter-spacing:.18em;color:#172033;background:#f8fafc;border:1px dashed #aeb9c8;border-radius:14px;padding:12px 16px;text-align:center;margin:10px 0}
       .${APP_ID}-network-status{padding:10px 12px;border-radius:11px;background:#eef4fb;border:1px solid #d8e4f2;color:#40516a;font-size:13px;margin-top:10px}
@@ -1316,7 +1329,10 @@
     const setupPlayers = network.role === 'local' ? state.players : state.players.slice(0, 2);
     const editableIndex = network.role === 'guest' ? 1 : 0;
     const playerRows = setupPlayers.map((player, index) => `
-      <div class="${APP_ID}-player-row">
+      <div class="${APP_ID}-player-row" data-player-row="${index}">
+        ${network.role === 'local' ? `<button type="button" class="${APP_ID}-btn ${APP_ID}-grip" data-move-player="${index}"
+          aria-label="${escapeHtml(player.name || 'Spieler ' + (index + 1))} verschieben, Platz ${index + 1}"
+          title="Ziehen oder mit den Pfeiltasten verschieben"><span aria-hidden="true">➳</span><span aria-hidden="true">➳</span><span aria-hidden="true">➳</span></button>` : ''}
         <input data-player-name="${index}" value="${escapeHtml(player.name)}" aria-label="Spieler ${index + 1}"
           ${network.role !== 'local' && index !== editableIndex ? 'disabled' : ''}>
       </div>
@@ -1530,6 +1546,7 @@
       // Status events may arrive while a player edits a name/address or opens a selector.
       // Input handlers save drafts immediately; defer replacement while a select has focus.
       if (panel.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
+      if (panel.querySelector('[data-sorting]') && state.screen === 'setup' && network.role === 'local') return;
       const focused = panel.contains(document.activeElement) ? document.activeElement : null;
       const focusId = focused?.id;
       const focusPlayer = focused?.dataset.playerName;
@@ -1564,7 +1581,53 @@
     });
   }
 
+  function bindPlayerOrder(panel) {
+    const list = panel.querySelector(`#${APP_ID}-player-list`);
+    if (!list || network.role !== 'local') return;
+    let drag = null;
+    function rowAt(event) {
+      const row = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-player-row]');
+      return row && list.contains(row) ? row : null;
+    }
+    list.addEventListener('pointerdown', event => {
+      const grip = event.target.closest('[data-move-player]');
+      if (!grip || drag || !event.isPrimary || event.button !== 0) return;
+      drag = { grip, id: event.pointerId };
+      grip.dataset.sorting = '';
+      grip.setPointerCapture(event.pointerId);
+    });
+    list.addEventListener('pointermove', event => {
+      if (drag?.id !== event.pointerId) return;
+      list.querySelector('[data-drop]')?.removeAttribute('data-drop');
+      rowAt(event)?.setAttribute('data-drop', '');
+    });
+    function finish(event) {
+      if (drag?.id !== event.pointerId) return;
+      const from = Number(drag.grip.dataset.movePlayer);
+      const row = event.type === 'pointerup' ? rowAt(event) : null;
+      drag.grip.removeAttribute('data-sorting');
+      list.querySelector('[data-drop]')?.removeAttribute('data-drop');
+      drag = null;
+      if (row) movePlayer(from, Number(row.dataset.playerRow));
+      render();
+    }
+    list.addEventListener('pointerup', finish);
+    list.addEventListener('pointercancel', finish);
+    list.addEventListener('lostpointercapture', finish);
+    list.addEventListener('keydown', event => {
+      const grip = event.target.closest('[data-move-player]');
+      if (!grip || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      event.preventDefault();
+      const from = Number(grip.dataset.movePlayer);
+      const to = from + (event.key === 'ArrowUp' ? -1 : 1);
+      if (to < 0 || to >= state.players.length) return;
+      movePlayer(from, to);
+      requestAnimationFrame(() => panel.querySelector(`[data-move-player="${to}"]`)?.focus());
+    });
+  }
+
   function bindUi(panel) {
+    bindPlayerOrder(panel);
     panel.querySelectorAll('[data-mode]').forEach((button) => {
       button.addEventListener('click', () => {
         if (state.screen !== 'setup') return;
