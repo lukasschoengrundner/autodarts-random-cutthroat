@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts – Cricket Random Cutthroat
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.4.1
+// @version      0.4.2
 // @description  Cricket Random Cutthroat overlay for Autodarts. Local games or encrypted online rooms with a friend.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -19,7 +19,7 @@
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
   const NETWORK_STORAGE_KEY = 'autodarts-random-cutthroat:network:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.4.1';
+  const VERSION = '0.4.2';
   const ONLINE_PROTOCOL = 1;
   const ROOM_PREFIX = 'ad-rcc-';
   const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -819,12 +819,16 @@
     if (state.screen !== 'game' || state.winner !== null) return;
     // A manual change waits for the physical takeout; repeated clicks cannot skip players.
     if (actorInputMode(state.currentPlayer) === 'board' && state.boardGate === 'await-empty') return;
+    // Returning from review reuses the latest empty state of the shared local board.
+    const reviewedBoardIsEmpty = state.boardGate === 'review' && network.role === 'local'
+      && state.connected && boardOperational(lastBoard) && lastBoard.throws.length === 0
+      && lastBoard.event !== 'Manual reset' && !takingOut;
     if (state.visit && !state.legacyVisit) state.previousVisit = snapshotCurrentTurn();
     state.currentPlayer = (state.currentPlayer + 1) % state.players.length;
     state.turnSerial += 1;
     resetHandled = false;
     beginVisit();
-    state.boardGate = actorInputMode(state.currentPlayer) === 'board' ? 'await-empty' : 'ready';
+    state.boardGate = actorInputMode(state.currentPlayer) === 'board' && !reviewedBoardIsEmpty ? 'await-empty' : 'ready';
     state.notice = '';
     update();
     if (network.role === 'host' && state.currentPlayer === 0 && state.inputMode === 'board' && lastRawBoardMessage) {
@@ -1110,7 +1114,7 @@
     }
     if (!(network.role === 'host' && actorIndex === 1)) connectionStatus = board.running ? 'Board meldet Daten' : 'Erkennung ist angehalten';
     if (state.screen !== 'game' || state.boardGate === 'finished') { render(); return; }
-    if (state.boardGate === 'review') { render(); return; }
+    if (state.boardGate === 'review' && network.role !== 'local') { render(); return; }
     if (!boardOperational(board)) {
       blockForSync('Die Erkennung wurde angehalten oder neu gestartet. Board und Aufnahme vor dem Fortsetzen prüfen.', actorIndex);
       update();
@@ -1118,7 +1122,7 @@
     }
     if (board.event === 'Takeout finished' && board.throws.length === 0) takingOut = false;
     if (board.event === 'Takeout started' || board.status === 'Takeout in progress') { takingOut = true; update(); return; }
-    if (state.boardGate === 'sync') { render(); return; }
+    if (state.boardGate === 'sync' || state.boardGate === 'review') { render(); return; }
     if (board.event !== 'Manual reset') resetHandled = false;
     if (board.event === 'Manual reset') {
       if (resetHandled) return;

@@ -2,7 +2,9 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Cricket Random Cutthroat als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.4.1:** Erste Aufnahme ohne verworfene Startwürfe, drei feste Korrekturfelder auch für nicht erkannte Darts, absteigende Zielzahlen (Bull zuletzt) und behobene Online-Rückkopplung.
+**Version 0.4.2:** Nach der Korrektur des vorherigen Spielers zählt der nächste Wurf am bereits als leer gemeldeten lokalen Board sofort.
+
+Seit Version 0.4.1: Erste Aufnahme ohne verworfene Startwürfe, drei feste Korrekturfelder auch für nicht erkannte Darts, absteigende Zielzahlen (Bull zuletzt) und behobene Online-Rückkopplung.
 
 Seit Version 0.4.0: Zusätzlich zum lokalen Spiel gibt es private Online-Räume für zwei Spieler. Beide Spieler können ihr eigenes Autodarts-Board oder den Testmodus verwenden; Würfe, Korrekturen, Spielerwechsel und Spielstand werden zwischen den Browsern synchronisiert. Die automatisierten Tests verwenden simulierte Board- und Online-Meldungen. Ein gemeinsamer Praxistest über zwei echte Internetanschlüsse steht noch aus.
 

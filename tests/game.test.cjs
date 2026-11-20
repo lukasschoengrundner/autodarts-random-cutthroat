@@ -594,3 +594,66 @@ test('online player changes require the next players own board to be empty', () 
   remote(packet([], 'Takeout finished')); remote(packet([segment(18)]));
   assert.equal(h.s.players[1].marks[18], 2);
 });
+
+test('finishing a local review on an empty board counts the very next visit', () => {
+  const h = game();
+  h.send([segment(18)]);
+  h.send([], 'Takeout finished');
+  h.api.previousPlayer();
+  h.api.correctThrow(0, 'D18');
+  h.api.nextPlayer();
+
+  const darts = [segment(20), segment(16, 2), segment(17, 3)];
+  for (let i = 1; i <= darts.length; i++) {
+    h.send(darts.slice(0, i));
+    assert.equal(h.s.turnDarts, i);
+    assert.equal(h.s.currentPlayer, 1);
+  }
+  assert.equal(h.s.players[0].marks[18], 2);
+  assert.equal(h.s.players[1].marks[20], 1);
+  assert.equal(h.s.players[1].marks[16], 2);
+  assert.equal(h.s.players[1].marks[17], 3);
+  h.send([], 'Takeout finished');
+  h.send([], 'Takeout finished');
+  assert.equal(h.s.currentPlayer, 0);
+  assert.equal(h.s.turnSerial, 2);
+});
+
+test('a local review waits when the board is occupied or its state is uncertain', () => {
+  for (const duringReview of [
+    h => h.send([segment(5)]),
+    h => h.api.disconnectBoard(),
+    h => h.send([], 'Calibration started', { status: 'Calibrating' }),
+    h => h.send([], 'Manual reset'),
+    h => { h.send([], 'Takeout started'); h.send([]); },
+  ]) {
+    const h = game();
+    h.send([segment(18)]);
+    h.send([], 'Takeout finished');
+    h.api.previousPlayer();
+    duringReview(h);
+    h.api.nextPlayer();
+    assert.equal(h.s.boardGate, 'await-empty');
+    if (!h.s.connected) { h.api.connectBoard(); h.sockets.at(-1).emit('open'); }
+    h.send([segment(5)]);
+    assert.equal(h.s.turnDarts, 0);
+    h.send([], 'Takeout finished');
+    h.send([segment(20)]);
+    assert.equal(h.s.currentPlayer, 1);
+    assert.equal(h.s.players[1].marks[20], 1);
+  }
+});
+
+test('a takeout completed during local review frees the shared board without scoring the reviewed turn again', () => {
+  const h = game();
+  h.send([segment(18)]);
+  h.api.nextPlayer();
+  h.api.previousPlayer();
+  h.send([segment(18)], 'Takeout started');
+  h.send([], 'Takeout finished');
+  h.api.correctThrow(0, 'D18');
+  h.api.nextPlayer();
+  h.send([segment(20)]);
+  assert.equal(h.s.players[0].marks[18], 2);
+  assert.equal(h.s.players[1].marks[20], 1);
+});

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 – 2026-11-20
+
+- Nach der Korrektur des vorherigen Spielers zählt am gemeinsamen lokalen Board der erste Wurf der nächsten Aufnahme, wenn das Board bereits leer gemeldet ist.
+
 ## 0.4.1 – 2026-10-03
 
 - Erste Aufnahme nach bewusstem Start mit leerem Board direkt freigeben und bestehende Board-Verbindung erhalten; bekannte steckende Darts bleiben gesperrt.
