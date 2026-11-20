@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.4 – 2026-11-20
+
+- Flache Trefferfelder und Entnahme-Ereignisse von Board Manager 2.1 verarbeiten.
+
 ## 0.4.3 – 2026-11-20
 
 - Startreihenfolge im lokalen Setup per Maus, Touch oder Pfeiltasten ändern.

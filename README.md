@@ -2,7 +2,9 @@
 
 Ein Tampermonkey-Userscript für **play.autodarts.com** und **play.autodarts.io**. Es zeigt Cricket Random Cutthroat als Overlay an und verarbeitet Treffer vom lokalen Autodarts Board Manager.
 
-**Version 0.4.3:** Die Startreihenfolge lässt sich vor einer lokalen Partie ändern.
+**Version 0.4.4:** Kamera-Treffer und das Herausziehen der Darts werden auch im Nachrichtenformat von Board Manager 2.1 erkannt.
+
+Seit Version 0.4.3: Die Startreihenfolge lässt sich vor einer lokalen Partie ändern.
 
 Seit Version 0.4.2: Nach der Korrektur des vorherigen Spielers zählt der nächste Wurf am bereits als leer gemeldeten lokalen Board sofort.
 

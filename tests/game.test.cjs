@@ -711,3 +711,40 @@ test('a grip moves on drop or arrow key, and a cancelled touch leaves the order 
   handlers.keydown({ target: grip, key: 'ArrowUp', preventDefault() {} });
   assert.equal(h.s.players[0].name, 'Spieler 1');
 });
+
+test('Board Manager 2.1 flat throws count in the first visit and takeout advances once', () => {
+  const h = game();
+  const send = (event, status, throws) => h.api.handleBoardMessage(JSON.stringify({
+    type: 'state', data: { connected: true, running: true, event, status, throws },
+  }));
+  const single = n => ({ segmentNumber: n, segmentName: 'S' + n, multiplier: 1, bed: 'SingleInner' });
+  const darts = [single(17), single(16), single(12)];
+  for (let i = 1; i <= 3; i++) {
+    send('throwDetected', i === 3 ? 'takeout' : 'throw', darts.slice(0, i));
+    assert.equal(h.s.turnDarts, i);
+  }
+  assert.equal(h.s.players[0].marks[17], 1);
+  assert.equal(h.s.players[0].marks[16], 1);
+  send('takeoutStarted', 'takeoutInProgress', darts);
+  send('takeoutStarted', 'takeoutInProgress', []);
+  assert.equal(h.s.turnDarts, 3);
+  send('takeoutFinished', 'throw', []);
+  send('takeoutFinished', 'throw', []);
+  assert.equal(h.s.currentPlayer, 1);
+  send('throwDetected', 'throw', [single(17)]);
+  assert.equal(h.s.players[1].marks[17], 1);
+});
+
+test('Board Manager 2.1 outside hits consume a slot and malformed throws do not score', () => {
+  const h = game();
+  const send = throws => h.api.handleBoardMessage(JSON.stringify({ type: 'state',
+    data: { running: true, status: 'throw', event: 'throwDetected', throws } }));
+  const miss = { segmentNumber: 14, segmentName: 'M14', multiplier: 0, bed: 'Outside' };
+  send([miss]);
+  assert.equal(h.s.turnDarts, 1);
+  assert.equal(h.s.visit.throws[0].name, 'MISS');
+  send([miss, { segmentNumber: 17, multiplier: 7 }]);
+  assert.equal(h.s.turnDarts, 1);
+  send([miss, { segmentNumber: 20, multiplier: 3, segmentName: 'T20' }]);
+  assert.equal(h.s.players[0].marks[20], 3);
+});

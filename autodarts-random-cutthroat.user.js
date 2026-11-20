@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autodarts – Cricket Random Cutthroat
 // @namespace    https://github.com/lukasschoengrundner/autodarts-random-cutthroat
-// @version      0.4.3
+// @version      0.4.4
 // @description  Cricket Random Cutthroat overlay for Autodarts. Local games or encrypted online rooms with a friend.
 // @author       Lukas Schöngrundner
 // @match        https://play.autodarts.com/*
@@ -19,7 +19,7 @@
   const STORAGE_KEY = 'autodarts-random-cutthroat:v1';
   const NETWORK_STORAGE_KEY = 'autodarts-random-cutthroat:network:v1';
   const DEFAULT_BOARD_HOST = 'http://localhost:3180';
-  const VERSION = '0.4.3';
+  const VERSION = '0.4.4';
   const ONLINE_PROTOCOL = 1;
   const ROOM_PREFIX = 'ad-rcc-';
   const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -1076,9 +1076,21 @@
     if (!Number.isInteger(count) || count < 0 || count > 3) return null;
     const rawThrows = data.throws ?? (count === 0 ? [] : null);
     if (!Array.isArray(rawThrows) || rawThrows.length !== count) return null;
-    const throws = rawThrows.map((t) => normalizeSegment(t?.segment));
+    const throws = rawThrows.map(dart => {
+      if (dart?.segment) return normalizeSegment(dart.segment);
+      if (!dart || typeof dart !== 'object') return null;
+      if (dart.bouncer === true || (dart.bed === 'Outside' && dart.multiplier === 0)) {
+        return normalizeSegment({ name: 'MISS' });
+      }
+      if (dart.failed === true) return null;
+      return normalizeSegment({ number: dart.segmentNumber, multiplier: dart.multiplier, name: dart.segmentName });
+    });
     if (throws.some((t) => t === null)) return null;
-    return { throws, event: String(data.event || ''), status: String(data.status || ''), running: data.running !== false };
+    const event = String(data.event || '');
+    const status = String(data.status || '');
+    const aliases = { takeoutStarted: 'Takeout started', takeoutFinished: 'Takeout finished', manualReset: 'Manual reset' };
+    return { throws, event: Object.hasOwn(aliases, event) ? aliases[event] : event,
+      status: status === 'takeoutInProgress' ? 'Takeout in progress' : status, running: data.running !== false };
   }
   function boardOperational(board) {
     return board?.running && !/^(Starting|Stopped|Stopping|Calibration)/i.test(board.event)
