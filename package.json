@@ -5,7 +5,7 @@
   "description": "Development tests for the standalone Tampermonkey userscript",
   "scripts": {
     "test": "node --test tests/*.test.cjs",
-    "check": "node --check autodarts-random-cutthroat.user.js"
+    "check": "node --check autodarts-random-cutthroat.user.js && node --check v1/random-cutthroat.user.js"
   },
   "engines": {
     "node": ">=20"
